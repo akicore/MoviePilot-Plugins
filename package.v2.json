@@ -1,0 +1,17 @@
+{
+    "CloudDriveDisk": {
+        "v3": false,
+        "name": "CD2Storage",
+        "description": "CloudDrive2操作API接口",
+        "labels": "云盘",
+        "version": "0.0.1",
+        "release": true,
+        "icon": "Cloudrive_A.png",
+        "author": "AkiCore",
+        "system_version": ">=2.15.2",
+        "level": 1,
+        "history": {
+            "v0.0.1": "发布测试版本"
+        }
+    }
+}
