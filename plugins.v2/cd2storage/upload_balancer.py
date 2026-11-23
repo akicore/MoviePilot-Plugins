@@ -124,6 +124,13 @@ class UploadBalancer:
         trailing_slash = original.endswith("/")
         size = max(0, int(size))
 
+        logger.info(
+            "【CloudDrive】开始检查上传分流：原始目标路径=%s，文件大小=%d 字节，规则数=%d",
+            original,
+            size,
+            len(self.rules),
+        )
+
         with self._lock:
             now = time.time()
             self._prune(now)
@@ -136,7 +143,17 @@ class UploadBalancer:
                 None,
             )
             if rule is None:
+                logger.info(
+                    "【CloudDrive】上传路径未匹配任何分流规则：原始目标路径=%s，最终使用原路径",
+                    original,
+                )
                 return original, None
+
+            logger.info(
+                "【CloudDrive】上传路径匹配分流规则：原始目标路径=%s，命中前缀=%s",
+                original,
+                rule["prefix"],
+            )
 
             relative = normalized[len(rule["prefix"]) :].lstrip("/")
             usage: Dict[str, int] = {}
@@ -147,7 +164,16 @@ class UploadBalancer:
 
             for branch in rule["branches"]:
                 folder = branch["path"]
-                if usage.get(folder, 0) + size > branch["capacity_bytes"]:
+                current_usage = usage.get(folder, 0)
+                capacity = branch["capacity_bytes"]
+                if current_usage + size > capacity:
+                    logger.info(
+                        "【CloudDrive】分流目录额度不足，尝试下一目录：目录=%s，近24小时已用=%d 字节，本次=%d 字节，额度=%d 字节",
+                        folder,
+                        current_usage,
+                        size,
+                        capacity,
+                    )
                     continue
                 routed_path = folder + (f"/{relative}" if relative else "")
                 if trailing_slash and routed_path != "/":
@@ -155,8 +181,21 @@ class UploadBalancer:
                 self._next_token += 1
                 reservation = UploadReservation(self._next_token, folder, size)
                 self._reservations[reservation.token] = reservation
+                logger.info(
+                    "【CloudDrive】上传分流已选择目录：规则前缀=%s，分支目录=%s，最终目标路径=%s，额度占用=%d/%d 字节",
+                    rule["prefix"],
+                    folder,
+                    routed_path,
+                    current_usage + size,
+                    capacity,
+                )
                 return routed_path, reservation
 
+            logger.warning(
+                "【CloudDrive】匹配规则下所有分流目录额度均不足：原始目标路径=%s，规则前缀=%s，最终回退原路径",
+                original,
+                rule["prefix"],
+            )
             return original, None
 
     def finish(self, reservation: Optional[UploadReservation], success: bool) -> None:
@@ -172,6 +211,18 @@ class UploadBalancer:
                         "folder": reservation.folder,
                         "size": reservation.size,
                     }
+                )
+                logger.info(
+                    "【CloudDrive】分流上传成功并计入额度：目录=%s，本次=%d 字节，24小时记录数=%d",
+                    reservation.folder,
+                    reservation.size,
+                    len(self._records),
+                )
+            else:
+                logger.warning(
+                    "【CloudDrive】分流上传未成功，本次额度预留已释放：目录=%s，本次=%d 字节",
+                    reservation.folder,
+                    reservation.size,
                 )
             self._prune(time.time())
             self._persist()
@@ -206,6 +257,16 @@ class UploadBalancer:
                 rules.append({"prefix": rule["prefix"], "branches": branches})
 
             total_used = sum(usage.get(folder, 0) for folder in configured_folders)
+            logger.info(
+                "【CloudDrive】刷新24小时分流额度统计：有效记录数=%d，总额度=%d 字节，总已用=%d 字节，目录用量=%s",
+                len(self._records),
+                total_capacity,
+                total_used,
+                {
+                    folder: usage.get(folder, 0)
+                    for folder in sorted(configured_folders)
+                },
+            )
             return {
                 "rules": rules,
                 "total_capacity_bytes": total_capacity,

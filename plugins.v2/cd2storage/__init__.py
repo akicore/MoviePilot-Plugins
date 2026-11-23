@@ -565,12 +565,25 @@ class CD2Storage(_PluginBase):
         reservation = None
         original_path = fileitem.path
         routed_path = original_path
+        file_size = None
+        effective_path = original_path
+        logger.info(
+            "【CloudDrive】收到上传请求：原始目标路径=%s，本地文件=%s",
+            original_path,
+            path,
+        )
         if balancer:
             try:
                 file_size = path.stat().st_size
                 routed_path, reservation = balancer.reserve(original_path, file_size)
             except (OSError, TypeError, ValueError) as e:
                 logger.warning("【CloudDrive】无法应用上传分流，使用原目标目录: %s", e)
+
+        if not balancer:
+            logger.info(
+                "【CloudDrive】上传分流器未初始化，将使用原始目标路径：路径=%s",
+                original_path,
+            )
 
         result = None
         path_changed = False
@@ -579,6 +592,7 @@ class CD2Storage(_PluginBase):
                 try:
                     fileitem.path = routed_path
                     path_changed = True
+                    effective_path = fileitem.path
                 except Exception as e:
                     logger.warning(
                         "【CloudDrive】无法修改目标路径，使用原目录并释放分流额度: %s",
@@ -587,13 +601,41 @@ class CD2Storage(_PluginBase):
                     if balancer:
                         balancer.finish(reservation, success=False)
                     reservation = None
+                    effective_path = fileitem.path
+            else:
+                effective_path = fileitem.path
+            logger.info(
+                "【CloudDrive】开始执行上传：原始目标路径=%s，最终使用路径=%s，文件大小=%s 字节，分流额度预留=%s",
+                original_path,
+                effective_path,
+                file_size if file_size is not None else "未知",
+                "是" if reservation else "否",
+            )
             result = self._clouddrive_api.upload(fileitem, path, new_name)
+            if result is None:
+                logger.error(
+                    "【CloudDrive】上传接口未返回成功文件项：原始目标路径=%s，实际使用路径=%s",
+                    original_path,
+                    effective_path,
+                )
+            else:
+                logger.info(
+                    "【CloudDrive】上传接口返回成功：原始目标路径=%s，实际使用路径=%s，返回文件路径=%s",
+                    original_path,
+                    effective_path,
+                    getattr(result, "path", "未知"),
+                )
             return result
         finally:
             if path_changed:
                 fileitem.path = original_path
             if balancer:
                 balancer.finish(reservation, success=result is not None)
+            elif result is not None:
+                logger.info(
+                    "【CloudDrive】上传成功，但没有分流额度预留，本次不计入分支目录统计：路径=%s",
+                    effective_path,
+                )
 
     def delete_file(self, fileitem: FileItem) -> Optional[bool]:
         """
