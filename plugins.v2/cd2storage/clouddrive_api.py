@@ -1231,7 +1231,7 @@ class CloudDriveApi:
 
             chunk_size = 3 * 1024 * 1024
             offset = 0
-            with open(local_path, "rb") as f:
+            with open(local_path, "rb") as f: 
                 while True:
                     if global_vars.is_transfer_stopped(remote_path):
                         logger.info("【CloudDrive】上传已取消: %s", remote_path)
