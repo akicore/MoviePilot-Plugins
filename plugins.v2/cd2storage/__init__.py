@@ -263,6 +263,155 @@ class CD2Storage(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
+        stats = (
+            self._upload_balancer.get_usage_stats()
+            if self._upload_balancer
+            else {
+                "rules": [],
+                "total_capacity_bytes": 0,
+                "total_used_bytes": 0,
+                "total_remaining_bytes": 0,
+            }
+        )
+
+        def format_size(size: int) -> str:
+            return f"{size / 1_000_000_000:.2f} GB"
+
+        def info_card(title: str, value: str, cols: int = 3) -> dict:
+            return {
+                "component": "VCol",
+                "props": {"cols": 12, "sm": 6, "md": cols},
+                "content": [
+                    {
+                        "component": "VCard",
+                        "props": {"variant": "tonal"},
+                        "content": [
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-caption"},
+                                        "text": title,
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-h6"},
+                                        "text": value,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        page = [
+            {
+                "component": "VRow",
+                "content": [
+                    info_card("插件状态", "已启用" if self._enabled else "未启用"),
+                    info_card("CloudDrive2 地址", f"{self._host}:{self._port}"),
+                    info_card(
+                        "上传模式",
+                        "直写上传"
+                        if self._upload_mode == "direct_write"
+                        else "远程上传",
+                    ),
+                    info_card("令牌认证", "已配置" if self._token else "未配置"),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    info_card("分流目录总额度", format_size(stats["total_capacity_bytes"])),
+                    info_card("近 24 小时已用", format_size(stats["total_used_bytes"])),
+                    info_card("分流目录剩余额度", format_size(stats["total_remaining_bytes"])),
+                    info_card("分流规则数", str(len(stats["rules"]))),
+                ],
+            },
+        ]
+
+        for rule in stats["rules"]:
+            branch_rows = []
+            for branch in rule["branches"]:
+                capacity = branch["capacity_bytes"]
+                used = branch["used_bytes"]
+                percent = min(100, int(used * 100 / capacity)) if capacity else 0
+                branch_rows.append(
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VCard",
+                                "props": {"variant": "outlined"},
+                                "content": [
+                                    {
+                                        "component": "VCardText",
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-subtitle-1"},
+                                                "text": branch["path"],
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-body-2"},
+                                                "text": (
+                                                    f"已用 {format_size(used)} / "
+                                                    f"{format_size(capacity)} · 剩余 "
+                                                    f"{format_size(branch['remaining_bytes'])}"
+                                                ),
+                                            },
+                                            {
+                                                "component": "VProgressLinear",
+                                                "props": {
+                                                    "model-value": percent,
+                                                    "height": 6,
+                                                    "rounded": True,
+                                                },
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            page.append(
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-h6 mt-4 mb-2"},
+                                    "text": f"匹配前缀：{rule['prefix']}",
+                                }
+                            ],
+                        },
+                        *branch_rows,
+                    ],
+                }
+            )
+        if not stats["rules"]:
+            page.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "text": "尚未配置上传分流规则。",
+                    },
+                }
+            )
+        return page
+
+    def get_api(self) -> List[Dict[str, Any]]:
         return []
 
     def get_module(self) -> Dict[str, Any]:

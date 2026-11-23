@@ -175,3 +175,40 @@ class UploadBalancer:
                 )
             self._prune(time.time())
             self._persist()
+
+    def get_usage_stats(self) -> Dict[str, Any]:
+        """Return configured branch quotas and successful rolling-24-hour usage."""
+        with self._lock:
+            self._prune(time.time())
+            usage: Dict[str, int] = {}
+            for record in self._records:
+                folder = record["folder"]
+                usage[folder] = usage.get(folder, 0) + record["size"]
+
+            rules = []
+            total_capacity = 0
+            configured_folders = set()
+            for rule in self.rules:
+                branches = []
+                for branch in rule["branches"]:
+                    capacity = branch["capacity_bytes"]
+                    used = usage.get(branch["path"], 0)
+                    branches.append(
+                        {
+                            "path": branch["path"],
+                            "capacity_bytes": capacity,
+                            "used_bytes": used,
+                            "remaining_bytes": max(0, capacity - used),
+                        }
+                    )
+                    total_capacity += capacity
+                    configured_folders.add(branch["path"])
+                rules.append({"prefix": rule["prefix"], "branches": branches})
+
+            total_used = sum(usage.get(folder, 0) for folder in configured_folders)
+            return {
+                "rules": rules,
+                "total_capacity_bytes": total_capacity,
+                "total_used_bytes": total_used,
+                "total_remaining_bytes": max(0, total_capacity - total_used),
+            }
