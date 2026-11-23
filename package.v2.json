@@ -4,14 +4,14 @@
         "name": "CD2Storage",
         "description": "CloudDrive2存储客户端",
         "labels": "云盘",
-        "version": "0.5.2",
+        "version": "0.5.3",
         "release": true,
         "icon": "Cloudrive_A.png",
         "author": "AkiCore",
         "system_version": ">=2.15.2",
         "level": 1,
         "history": {
-            "v0.5.2": "发布测试版本"
+            "v0.5.3": "发布测试版本"
         }
     }
 }

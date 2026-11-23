@@ -19,6 +19,8 @@ from app.schemas.exception import StorageQueryError
 
 from clouddrive2_client import CloudDriveClient
 
+from .upload_balancer import UploadBalancer
+
 
 # 115/CD2：移动或「从含撇号的旧名改到其它名」时不稳定；先脱敏的是**源侧末段名/路径**
 # 最终目标名 `new_name` 仍可含 ASCII 撇号（改为带撇号的展示名通常可用），本模块不禁止
@@ -130,6 +132,7 @@ class CloudDriveApi:
         disk_name: str,
         download_base: Optional[str] = None,
         upload_mode: Literal["remote_upload", "direct_write"] = "direct_write",
+        upload_balancer: Optional[UploadBalancer] = None,
     ) -> None:
         """
         初始化 CloudDrive API 封装
@@ -143,6 +146,7 @@ class CloudDriveApi:
         self._disk_name = disk_name
         self._download_base = (download_base or "http://127.0.0.1:19798").rstrip("/")
         self._upload_mode = upload_mode
+        self._upload_balancer = upload_balancer
         self.transtype = {"move": "移动", "copy": "复制"}
 
     def list(self, fileitem: FileItem) -> List[FileItem]:
@@ -932,23 +936,81 @@ class CloudDriveApi:
         local_path: Path,
         new_name: Optional[str] = None,
     ) -> Optional[FileItem]:
-        """
-        上传文件到 CloudDrive
+        """Upload through the common API entry point, applying balancing once."""
+        balancer = self._upload_balancer
+        original_path = target_dir.path or "/"
+        routed_path = original_path
+        file_size = None
+        reservation = None
+        path_changed = False
+        result = None
 
-        upload_mode:
-        - remote_upload: Remote Upload 协议（StartRemoteUpload → RemoteUploadChannel）
-        - direct_write: CreateFile/WriteToFile/CloseFile 直写上传，并等待云端上传完成
+        logger.info(
+            "【CloudDrive】进入 CloudDriveApi.upload：原始目标目录=%s，本地文件=%s，分流器=%s",
+            original_path,
+            local_path,
+            "已启用" if balancer else "未启用",
+        )
 
-        :param target_dir (FileItem): 目标目录 FileItem
-        :param local_path (Path): 本地文件路径
-        :param new_name (str): 云端文件名，None 则用 local_path.name
+        if balancer and target_dir.storage == self._disk_name:
+            try:
+                file_size = local_path.stat().st_size
+                routed_path, reservation = balancer.reserve(original_path, file_size)
+            except (OSError, TypeError, ValueError) as e:
+                logger.warning(
+                    "【CloudDrive】无法应用上传分流，将使用原目标目录：目标=%s，文件=%s，原因=%s",
+                    original_path,
+                    local_path,
+                    e,
+                )
 
-        :return FileItem: 上传成功返回云端文件 FileItem，失败返回 None
-        """
-        mode = (self._upload_mode or "direct_write").strip() or "direct_write"
-        if mode == "direct_write":
-            return self._upload_direct_write(target_dir, local_path, new_name)
-        return self._upload_remote_upload(target_dir, local_path, new_name)
+        try:
+            if routed_path != original_path:
+                try:
+                    target_dir.path = routed_path
+                    path_changed = True
+                except Exception as e:
+                    logger.warning(
+                        "【CloudDrive】无法修改上传目标目录，回退原目录并释放额度：原目录=%s，分流目录=%s，原因=%s",
+                        original_path,
+                        routed_path,
+                        e,
+                    )
+                    if balancer:
+                        balancer.finish(reservation, success=False)
+                    reservation = None
+                    routed_path = original_path
+
+            logger.info(
+                "【CloudDrive】执行上传：原始目标目录=%s，最终目标目录=%s，文件=%s，大小=%s 字节，已预留分流额度=%s",
+                original_path,
+                routed_path,
+                local_path,
+                file_size if file_size is not None else "未知",
+                "是" if reservation else "否",
+            )
+
+            mode = (self._upload_mode or "direct_write").strip() or "direct_write"
+            if mode == "direct_write":
+                result = self._upload_direct_write(target_dir, local_path, new_name)
+            else:
+                result = self._upload_remote_upload(target_dir, local_path, new_name)
+
+            logger.info(
+                "【CloudDrive】上传%s：原始目标目录=%s，实际目标目录=%s，返回文件路径=%s",
+                "成功" if result is not None else "失败",
+                original_path,
+                routed_path,
+                getattr(result, "path", "未知") if result is not None else "无",
+            )
+            return result
+        finally:
+            try:
+                if path_changed:
+                    target_dir.path = original_path
+            finally:
+                if balancer:
+                    balancer.finish(reservation, success=result is not None)
 
     def _upload_remote_upload(
         self,
