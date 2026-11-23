@@ -1,7 +1,7 @@
-# Go build output
+__pycache__/
 dist/
 
-# Go binaries
+
 *.exe
 *.dll
 *.so
