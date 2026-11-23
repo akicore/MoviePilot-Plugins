@@ -1,14 +1,14 @@
 import json
-import logging
 import math
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from app.log import logger
+
 
 WINDOW_SECONDS = 24 * 60 * 60
 BYTES_PER_GB = 1_000_000_000
-logger = logging.getLogger(__name__)
 
 
 def _normalize_path(path: Any) -> str:
