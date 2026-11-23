@@ -25,7 +25,7 @@ class CD2Storage(_PluginBase):
     """
 
     plugin_name = "CD2Storage"
-    plugin_desc = "CloudDrive2操作API接口"
+    plugin_desc = "CloudDrive2存储客户端"
     plugin_icon = "Cloudrive_A.png"
     plugin_version = VERSION
     plugin_author = "AkiCore"
