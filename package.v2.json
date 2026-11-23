@@ -1,5 +1,5 @@
 {
-    "CloudDriveDisk": {
+    "CD2Storage": {
         "v3": false,
         "name": "CD2Storage",
         "description": "CloudDrive2操作API接口",

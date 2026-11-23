@@ -19,7 +19,7 @@ from .upload_balancer import UploadBalancer, parse_rules
 from .version import VERSION
 
 
-class CloudDriveDisk(_PluginBase):
+class CD2Storage(_PluginBase):
     """
     CD2Storage
     """
