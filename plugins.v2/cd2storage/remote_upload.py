@@ -2,6 +2,7 @@
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+import os
 from os import fstat
 from pathlib import Path
 from threading import Event, Lock
@@ -22,10 +23,11 @@ class ReadResult:
 
 
 class RemoteReadDispatcher:
-    """Only the upload thread submits/polls; workers own their file handles.
+    """One open source per upload; workers read independent offsets with pread.
 
     send_data starts a cancellable RPC and returns its Future. RPC deadlines
     belong to that callable. Capacity is acquired before reading any file data.
+    Platforms without pread serialize seek/read on the same unbuffered handle.
     """
 
     MAX_WORKERS = 4
@@ -59,9 +61,18 @@ class RemoteReadDispatcher:
         self.completed_bytes = 0
         self.completed_requests = 0
         self.max_active_rpcs = 0
-        self._executor = ThreadPoolExecutor(
-            max_workers=self.MAX_WORKERS, thread_name_prefix="cd2-remote-read"
-        )
+        self._read_lock = Lock()
+        self._pread = getattr(os, "pread", None)
+        self._source = path.open("rb", buffering=0)
+        try:
+            if self._file_signature(fstat(self._source.fileno())) != self._signature:
+                raise OSError("Source file changed before remote upload")
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.MAX_WORKERS, thread_name_prefix="cd2-remote-read"
+            )
+        except BaseException:
+            self._source.close()
+            raise
 
     @property
     def pending_count(self) -> int:
@@ -104,16 +115,19 @@ class RemoteReadDispatcher:
         if self._stopped.is_set():
             raise RemoteUploadCancelled("Remote upload stopped")
         started = monotonic()
-        # Never share seek/read state between workers.
-        with self._path.open("rb") as source:
-            if self._file_signature(fstat(source.fileno())) != self._signature:
-                raise OSError("Source file changed during remote upload")
-            source.seek(offset)
-            data = source.read(length)
-            if len(data) != length:
-                raise OSError(f"Short source read at {offset}: {len(data)}/{length}")
-            if self._file_signature(fstat(source.fileno())) != self._signature:
-                raise OSError("Source file changed while reading remote upload data")
+        source_fd = self._source.fileno()
+        # Check the path too: fstat alone cannot detect a replaced source path
+        # once this upload has pinned the original inode with an open handle.
+        if (
+            self._file_signature(self._path.stat()) != self._signature
+            or self._file_signature(fstat(source_fd)) != self._signature
+        ):
+            raise OSError("Source file changed during remote upload")
+        data = self._read_at(offset, length)
+        if len(data) != length:
+            raise OSError(f"Short source read at {offset}: {len(data)}/{length}")
+        if self._file_signature(fstat(source_fd)) != self._signature:
+            raise OSError("Source file changed while reading remote upload data")
         read_finished = monotonic()
         with self._rpc_lock:
             if self._stopped.is_set():
@@ -142,6 +156,27 @@ class RemoteReadDispatcher:
         finally:
             with self._rpc_lock:
                 self._active_rpcs.discard(rpc)
+
+    def _read_at(self, offset: int, length: int) -> bytes:
+        """Read only the requested range, retrying partial reads without prefetch."""
+        chunks = []
+        remaining = length
+        while remaining:
+            if self._stopped.is_set():
+                raise RemoteUploadCancelled("Remote upload stopped")
+            if self._pread is not None:
+                chunk = self._pread(self._source.fileno(), remaining, offset)
+            else:
+                # Compatibility path: keep seek/read atomic, never the RPC wait.
+                with self._read_lock:
+                    self._source.seek(offset)
+                    chunk = self._source.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
 
     def poll(self) -> None:
         """Surface worker errors/cancellation even when CD2 sends no messages."""
@@ -184,14 +219,17 @@ class RemoteReadDispatcher:
         self._ensure_running()
 
     def close(self) -> None:
-        """Cancel outstanding RPCs before waiting for workers to release data."""
+        """Cancel RPCs and join all workers before closing the pinned source."""
         with self._rpc_lock:
             self._stopped.set()
             active_rpcs = list(self._active_rpcs)
-        for rpc in active_rpcs:
-            rpc.cancel()
-        for task in self._pending:
-            task.cancel()
-        self._executor.shutdown(wait=True, cancel_futures=True)
-        self._pending.clear()
-        self._buffer_bytes = 0
+        try:
+            for rpc in active_rpcs:
+                rpc.cancel()
+            for task in self._pending:
+                task.cancel()
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._source.close()
+            self._pending.clear()
+            self._buffer_bytes = 0
