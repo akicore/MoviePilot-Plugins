@@ -1,7 +1,7 @@
 from enum import IntEnum
 from pathlib import Path, PurePosixPath
-from queue import Empty, Queue
-from threading import Thread
+from queue import Empty, Full, Queue
+from threading import Event, Thread
 from time import monotonic, sleep
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 from uuid import uuid4
@@ -18,7 +18,9 @@ from app.schemas import FileItem, StorageUsage
 from app.schemas.exception import StorageQueryError
 
 from clouddrive2_client import CloudDriveClient
+from clouddrive2_client.proto import clouddrive_pb2
 
+from .remote_upload import ReadResult, RemoteReadDispatcher, RemoteUploadCancelled
 from .upload_balancer import UploadBalancer
 
 
@@ -881,43 +883,64 @@ class CloudDriveApi:
         return file_md5.finalize().hex(), blocks
 
     @staticmethod
-    def _iter_stream_with_timeout(stream, timeout: int = 300) -> Iterator:
-        """
-        包装 gRPC 服务端流，为每条消息添加超时
+    def _iter_stream_with_timeout(
+        stream,
+        timeout: int = 300,
+        check_callback: Optional[Callable[[], None]] = None,
+    ) -> Iterator:
+        """Bound queued requests; poll read failures/cancellation while idle."""
+        q: Queue = Queue(maxsize=16)
+        stopped = Event()
+        sentinel = object()
 
-        :param stream (Iterator): gRPC 服务端流迭代器
-        :param timeout (int): 每条消息的超时秒数，默认 300 秒
-
-        :return Iterator: 包装后的迭代器
-        """
-        q: Queue = Queue()
-        _SENTINEL = object()
+        def _put(item) -> bool:
+            while not stopped.is_set():
+                try:
+                    q.put(item, timeout=0.1)
+                    return True
+                except Full:
+                    pass
+            return False
 
         def _reader() -> None:
             try:
                 for msg in stream:
-                    q.put(msg)
-                q.put(_SENTINEL)
+                    if not _put(msg):
+                        return
+                _put(sentinel)
             except Exception as e:
-                q.put(e)
+                _put(e)
 
-        t = Thread(target=_reader, daemon=True, name="cd2-stream-reader")
-        t.start()
-
-        while True:
+        reader = Thread(target=_reader, daemon=True, name="cd2-stream-reader")
+        reader.start()
+        try:
+            while True:
+                deadline = monotonic() + timeout
+                while True:
+                    if check_callback:
+                        check_callback()
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"gRPC 流超时：{timeout} 秒内未收到服务端消息"
+                        )
+                    try:
+                        item = q.get(timeout=min(0.1, remaining))
+                        break
+                    except Empty:
+                        pass
+                if item is sentinel:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stopped.set()
             try:
-                item = q.get(timeout=timeout)
-            except Empty:
-                try:
-                    stream.cancel()
-                except Exception:
-                    pass
-                raise TimeoutError(f"gRPC 流超时：{timeout} 秒内未收到服务端消息")
-            if item is _SENTINEL:
-                return
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+                stream.cancel()
+            except Exception:
+                pass
+            reader.join(timeout=1)
 
     def _cancel_upload(self, upload_id: str) -> None:
         """
@@ -1293,6 +1316,8 @@ class CloudDriveApi:
         """
         progress_callback = transfer_process(target_path)
         stream = None
+        replies = None
+        reads = None
         upload_id = None
         upload_finished = False
         try:
@@ -1307,168 +1332,186 @@ class CloudDriveApi:
                 client_can_calculate_hashes=True,
             )
             upload_id = started.upload_id
-            with open(local_path, "rb") as f:
-                for reply in self._iter_stream_with_timeout(stream, timeout=300):
-                    if global_vars.is_transfer_stopped(target_path):
-                        logger.info("【CloudDrive】上传已取消: %s", target_path)
-                        self._cancel_upload(upload_id)
-                        return None
-                    which = reply.WhichOneof("request")
-                    if not which:
-                        continue
-                    if reply.upload_id != upload_id:
-                        continue
-                    if which == "read_data":
-                        req = reply.read_data
-                        offset = req.offset
-                        length = req.length
-                        f.seek(offset)
-                        data = f.read(length)
-                        is_last = (offset + len(data)) >= file_size
-                        try:
-                            resp = self.client.remote_read_data(
-                                upload_id=upload_id,
-                                offset=offset,
-                                length=len(data),
-                                data=data,
-                                is_last_chunk=is_last,
-                                lazy_read=getattr(req, "lazy_read", False),
-                            )
-                            logger.info(
-                                f"【CloudDrive】RemoteReadData 成功: {offset} {len(data)}"
-                            )
-                        except Exception as e:
-                            logger.error("【CloudDrive】RemoteReadData 失败: %s", e)
-                            self._cancel_upload(upload_id)
-                            return None
-                        if not resp.success:
-                            logger.error(
-                                "【CloudDrive】RemoteReadData 服务端失败: %s",
-                                resp.error_message,
-                            )
-                            return None
-                        if file_size:
-                            progress_callback((offset + len(data)) * 100.0 / file_size)
-                    elif which == "hash_data":
-                        req = reply.hash_data
-                        ht = req.hash_type
-                        block_size = getattr(req, "block_size", 0) or 0
 
-                        def _report_hash_progress(
-                            bytes_hashed: int,
-                            total_bytes: int,
-                            hash_value: str = "",
-                            blocks: Optional[List[str]] = None,
-                        ) -> None:
-                            try:
-                                resp = self.client.remote_hash_progress(
-                                    upload_id=upload_id,
-                                    bytes_hashed=bytes_hashed,
-                                    total_bytes=total_bytes,
-                                    hash_type=ht,
-                                    hash_value=hash_value,
-                                    block_hashes=blocks,
-                                )
-                                logger.info(
-                                    "【CloudDrive】上报本地哈希计算状态: %s", resp
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    "【CloudDrive】上报本地哈希计算状态失败: %s", e
-                                )
+            def _check_cancelled() -> None:
+                if global_vars.is_transfer_stopped(target_path):
+                    raise RemoteUploadCancelled(target_path)
 
-                        if global_vars.is_transfer_stopped(target_path):
-                            _report_hash_progress(0, file_size)
-                            logger.info("【CloudDrive】上传已取消: %s", target_path)
-                            self._cancel_upload(upload_id)
-                            return None
-                        hash_val: Optional[str]
-                        block_hashes: Optional[List[str]] = None
-                        cancelled_ref: List[bool] = [False]
+            # Use the public gRPC future API so in-flight calls have deadlines
+            # and can be cancelled when this upload is stopped or fails.
+            metadata = []
+            if self.client.jwt_token:
+                metadata.append(("authorization", f"Bearer {self.client.jwt_token}"))
 
-                        def _hash_progress_callback(bh: int, tb: int) -> None:
-                            if global_vars.is_transfer_stopped(target_path):
-                                cancelled_ref[0] = True
-                                _report_hash_progress(bh, tb)
-                                return
-                            _report_hash_progress(bh, tb)
+            def _send_data(offset, data, is_last, lazy_read):
+                request = clouddrive_pb2.RemoteReadDataUpload(
+                    upload_id=upload_id,
+                    offset=offset,
+                    length=len(data),
+                    data=data,
+                    is_last_chunk=is_last,
+                    lazy_read=lazy_read,
+                )
+                return self.client.stub.RemoteReadData.future(
+                    request, metadata=metadata, timeout=120
+                )
 
-                        if ht == HashType.MD5 and block_size > 0:
-                            hash_val, block_hashes = self._compute_file_md5_with_blocks(
-                                local_path,
-                                block_size,
-                                progress_callback=_hash_progress_callback,
-                                cancelled_ref=cancelled_ref,
-                            )
-                            if cancelled_ref[0]:
-                                self._cancel_upload(upload_id)
-                                return None
-                        else:
-                            hash_val = precomputed_hashes.get(ht)
-                            if hash_val is None:
-                                hash_val = self._compute_file_hash(local_path, ht)
-                        if global_vars.is_transfer_stopped(target_path):
-                            _report_hash_progress(file_size, file_size)
-                            self._cancel_upload(upload_id)
-                            return None
+            def _on_read_result(result: ReadResult) -> None:
+                logger.debug(
+                    "【CloudDrive】RemoteReadData: upload=%s offset=%d bytes=%d "
+                    "read_ms=%.3f rpc_ms=%.3f",
+                    upload_id,
+                    result.offset,
+                    result.length,
+                    result.read_seconds * 1000,
+                    result.rpc_seconds * 1000,
+                )
+
+            reads = RemoteReadDispatcher(
+                local_path,
+                file_size,
+                _send_data,
+                _check_cancelled,
+                progress_callback,
+                _on_read_result,
+            )
+            logger.info(
+                "【CloudDrive】远程上传取数: upload=%s workers=%d buffer_bytes=%d",
+                upload_id,
+                reads.MAX_WORKERS,
+                reads.MAX_BUFFER_BYTES,
+            )
+            replies = self._iter_stream_with_timeout(
+                stream, timeout=300, check_callback=reads.poll
+            )
+            for reply in replies:
+                _check_cancelled()
+                which = reply.WhichOneof("request")
+                if not which:
+                    continue
+                if reply.upload_id != upload_id:
+                    continue
+                if which == "read_data":
+                    req = reply.read_data
+                    reads.submit(
+                        req.offset, req.length, getattr(req, "lazy_read", False)
+                    )
+                elif which == "hash_data":
+                    req = reply.hash_data
+                    ht = req.hash_type
+                    block_size = getattr(req, "block_size", 0) or 0
+
+                    def _report_hash_progress(
+                        bytes_hashed: int,
+                        total_bytes: int,
+                        hash_value: str = "",
+                        blocks: Optional[List[str]] = None,
+                    ) -> None:
                         try:
                             resp = self.client.remote_hash_progress(
                                 upload_id=upload_id,
-                                bytes_hashed=file_size,
-                                total_bytes=file_size,
+                                bytes_hashed=bytes_hashed,
+                                total_bytes=total_bytes,
                                 hash_type=ht,
-                                hash_value=hash_val or "",
-                                block_hashes=block_hashes,
+                                hash_value=hash_value,
+                                block_hashes=blocks,
                             )
-                            logger.info(f"【CloudDrive】上报本地哈希计算状态: {resp}")
+                            logger.info(
+                                "【CloudDrive】上报本地哈希计算状态: %s", resp
+                            )
                         except Exception as e:
-                            logger.warning(
-                                "【CloudDrive】RemoteHashProgress 失败: %s", e
+                            logger.error(
+                                "【CloudDrive】上报本地哈希计算状态失败: %s", e
                             )
-                            self._cancel_upload(upload_id)
+
+                    if global_vars.is_transfer_stopped(target_path):
+                        _report_hash_progress(0, file_size)
+                        logger.info("【CloudDrive】上传已取消: %s", target_path)
+                        return None
+                    hash_val: Optional[str]
+                    block_hashes: Optional[List[str]] = None
+                    cancelled_ref: List[bool] = [False]
+
+                    def _hash_progress_callback(bh: int, tb: int) -> None:
+                        reads.poll()
+                        if global_vars.is_transfer_stopped(target_path):
+                            cancelled_ref[0] = True
+                            _report_hash_progress(bh, tb)
+                            return
+                        _report_hash_progress(bh, tb)
+
+                    if ht == HashType.MD5 and block_size > 0:
+                        hash_val, block_hashes = self._compute_file_md5_with_blocks(
+                            local_path,
+                            block_size,
+                            progress_callback=_hash_progress_callback,
+                            cancelled_ref=cancelled_ref,
+                        )
+                        if cancelled_ref[0]:
                             return None
-                    elif which == "status_changed":
-                        st = reply.status_changed.status
-                        if st == UploadStatus.FINISH:
-                            progress_callback(100)
-                            upload_finished = True
-                            logger.info(f"【CloudDrive】上传完成状态码: {st}")
-                            break
-                        if st in (UploadStatus.ERROR, UploadStatus.FATAL_ERROR):
-                            msg = reply.status_changed.error_message or "上传失败"
-                            logger.error("【CloudDrive】上传状态错误: %s", msg)
-                            self._cancel_upload(upload_id)
-                            return None
+                    else:
+                        hash_val = precomputed_hashes.get(ht)
+                        if hash_val is None:
+                            hash_val = self._compute_file_hash(local_path, ht)
+                    if global_vars.is_transfer_stopped(target_path):
+                        _report_hash_progress(file_size, file_size)
+                        return None
+                    try:
+                        resp = self.client.remote_hash_progress(
+                            upload_id=upload_id,
+                            bytes_hashed=file_size,
+                            total_bytes=file_size,
+                            hash_type=ht,
+                            hash_value=hash_val or "",
+                            block_hashes=block_hashes,
+                        )
+                        logger.info(f"【CloudDrive】上报本地哈希计算状态: {resp}")
+                    except Exception as e:
+                        logger.warning(
+                            "【CloudDrive】RemoteHashProgress 失败: %s", e
+                        )
+                        return None
+                elif which == "status_changed":
+                    st = reply.status_changed.status
+                    if st == UploadStatus.FINISH:
+                        reads.finish()
+                        progress_callback(100)
+                        upload_finished = True
+                        logger.info(f"【CloudDrive】上传完成状态码: {st}")
+                        break
+                    if st in (UploadStatus.ERROR, UploadStatus.FATAL_ERROR):
+                        msg = reply.status_changed.error_message or "上传失败"
+                        logger.error("【CloudDrive】上传状态错误: %s", msg)
+                        return None
+        except RemoteUploadCancelled:
+            logger.info("【CloudDrive】上传已取消: %s", target_path)
+            return None
         except TimeoutError as e:
             logger.warning("【CloudDrive】上传流超时: %s", e)
-            if upload_id:
-                self._cancel_upload(upload_id)
             return None
         except Exception as e:
             logger.error("【CloudDrive】上传过程异常: %s", e)
-            if upload_id:
-                self._cancel_upload(upload_id)
             return None
         finally:
-            if stream is not None:
-                if upload_finished:
-                    _stream_ref = stream
-
-                    def _drain_stream() -> None:
-                        try:
-                            for _ in _stream_ref:
-                                pass
-                        except Exception:
-                            pass
-
-                    Thread(
-                        target=_drain_stream, daemon=True, name="cd2-stream-drain"
-                    ).start()
-                else:
-                    try:
-                        stream.cancel()
-                    except Exception:
-                        pass
+            if reads is not None:
+                reads.close()
+                logger.info(
+                    "【CloudDrive】远程取数结束: upload=%s requests=%d "
+                    "unique_bytes=%d max_parallel_rpcs=%d",
+                    upload_id,
+                    reads.completed_requests,
+                    reads.completed_bytes,
+                    reads.max_active_rpcs,
+                )
+            if replies is not None:
+                replies.close()
+            elif stream is not None:
+                try:
+                    stream.cancel()
+                except Exception:
+                    pass
+            if upload_id and not upload_finished:
+                self._cancel_upload(upload_id)
         if not upload_finished:
             return None
         logger.info(f"【CloudDrive】上传完成: {target_path}")
