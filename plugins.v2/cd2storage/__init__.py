@@ -16,6 +16,7 @@ from app.schemas import (
 from app.schemas.types import ChainEventType
 
 from .clouddrive_api import CloudDriveApi
+from .local_upload import parse_local_mappings
 from .upload_balancer import UploadBalancer, parse_rules
 from .version import VERSION
 
@@ -42,7 +43,7 @@ class CD2Storage(_PluginBase):
     _host = ""
     _port = "19798"
     _token = ""
-    UploadMode = Literal["remote_upload", "direct_write"]
+    UploadMode = Literal["remote_upload", "direct_write", "local_upload"]
     _upload_mode: UploadMode = "direct_write"
     _upload_balancer: Optional[UploadBalancer] = None
 
@@ -76,6 +77,13 @@ class CD2Storage(_PluginBase):
             self.UploadMode,
             (config.get("upload_mode") or "direct_write").strip() or "direct_write",
         )
+        try:
+            local_upload_mappings = parse_local_mappings(
+                config.get("upload_local_mappings")
+            )
+        except (TypeError, ValueError) as e:
+            logger.error("【CloudDrive】本地上传路径映射无效，已停用映射: %s", e)
+            local_upload_mappings = []
         try:
             balance_rules = parse_rules(config.get("upload_balance_rules"))
         except (TypeError, ValueError) as e:
@@ -123,6 +131,7 @@ class CD2Storage(_PluginBase):
                 upload_mode=self._upload_mode,
                 upload_balancer=self._upload_balancer,
                 remote_device_id=remote_device_id,
+                local_upload_mappings=local_upload_mappings,
             )
         except Exception as e:
             logger.error("【CloudDrive】客户端创建失败: %s", e)
@@ -226,11 +235,34 @@ class CD2Storage(_PluginBase):
                                             "items": [
                                                 {"title": "直写上传", "value": "direct_write"},
                                                 {"title": "远程上传", "value": "remote_upload"},
+                                                {"title": "本地上传（CD2读取）", "value": "local_upload"},
                                             ],
                                         },
                                     }
                                 ],
                             },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "upload_local_mappings",
+                                            "label": "本地上传路径映射（JSON）",
+                                            "rows": 5,
+                                            "auto-grow": True,
+                                            "hint": '示例：[ {"mp_prefix":"/PTTemp/","cd2_prefix":"/PTTemp/"} ]。cd2_prefix 是 CD2 中已添加的本地文件夹虚拟路径；多个映射按最长前缀优先。仅本地上传模式使用，未匹配时回退远程上传。',
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            }
                         ],
                     },
                     {
@@ -263,6 +295,7 @@ class CD2Storage(_PluginBase):
             "port": "19798",
             "token": "",
             "upload_mode": "direct_write",
+            "upload_local_mappings": "",
             "upload_balance_rules": "",
         }
 
@@ -320,6 +353,8 @@ class CD2Storage(_PluginBase):
                         "上传模式",
                         "直写上传"
                         if self._upload_mode == "direct_write"
+                        else "本地上传（CD2读取）"
+                        if self._upload_mode == "local_upload"
                         else "远程上传",
                     ),
                     info_card("令牌认证", "已配置" if self._token else "未配置"),

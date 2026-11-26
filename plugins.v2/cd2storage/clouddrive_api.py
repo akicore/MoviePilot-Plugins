@@ -17,6 +17,7 @@ from app.schemas.exception import StorageQueryError
 from clouddrive2_client import CloudDriveClient
 from clouddrive2_client.proto import clouddrive_pb2
 
+from .local_upload import LocalPathMapping, LocalUpload, LocalUploadRpc, match_local_path
 from .remote_channel import RemoteUploadChannel
 from .remote_hash import HashResult, RemoteHashCache, RemoteHashDispatcher
 from .remote_upload import ReadResult, RemoteReadDispatcher, RemoteUploadCancelled
@@ -120,9 +121,10 @@ class CloudDriveApi:
         client: CloudDriveClient,
         disk_name: str,
         download_base: Optional[str] = None,
-        upload_mode: Literal["remote_upload", "direct_write"] = "direct_write",
+        upload_mode: Literal["remote_upload", "direct_write", "local_upload"] = "direct_write",
         upload_balancer: Optional[UploadBalancer] = None,
         remote_device_id: Optional[str] = None,
+        local_upload_mappings: Optional[List[LocalPathMapping]] = None,
     ) -> None:
         """
         初始化 CloudDrive API 封装
@@ -136,6 +138,7 @@ class CloudDriveApi:
         self._disk_name = disk_name
         self._download_base = (download_base or "http://127.0.0.1:19798").rstrip("/")
         self._upload_mode = upload_mode
+        self._local_upload_mappings = local_upload_mappings or []
         self._upload_balancer = upload_balancer
         self._remote_channel = RemoteUploadChannel(
             client,
@@ -838,6 +841,18 @@ class CloudDriveApi:
             mode = (self._upload_mode or "direct_write").strip() or "direct_write"
             if mode == "direct_write":
                 result = self._upload_direct_write(target_dir, local_path, new_name)
+            elif mode == "local_upload":
+                mapped = match_local_path(str(local_path), self._local_upload_mappings)
+                if mapped is None:
+                    logger.info(
+                        "【CloudDrive】源路径没有匹配本地上传映射，回退远程上传: %s",
+                        local_path,
+                    )
+                    result = self._upload_remote_upload(target_dir, local_path, new_name)
+                else:
+                    result = self._upload_local_source(
+                        target_dir, local_path, mapped[1], new_name
+                    )
             else:
                 result = self._upload_remote_upload(target_dir, local_path, new_name)
 
@@ -856,6 +871,71 @@ class CloudDriveApi:
             finally:
                 if balancer:
                     balancer.finish(reservation, success=result is not None)
+
+    def _upload_local_source(
+        self,
+        target_dir: FileItem,
+        local_path: Path,
+        cd2_source_path: str,
+        new_name: Optional[str] = None,
+    ) -> Optional[FileItem]:
+        """Ask CD2 to copy its configured local-folder source into the cloud."""
+        try:
+            stat = local_path.stat()
+            if not local_path.is_file():
+                raise OSError(f"本地上传源不是普通文件: {local_path}")
+            rpc = LocalUploadRpc(self.client)
+            source = rpc.find(cd2_source_path)
+            if (
+                not source
+                or not source.id
+                or not source.isLocal
+                or source.isDirectory
+                or source.size != stat.st_size
+            ):
+                raise OSError(
+                    "CD2 本地映射源未验证通过（必须是已添加的本地文件夹内同大小文件）: "
+                    f"{cd2_source_path}"
+                )
+
+            target_dir_path = (target_dir.path or "/").rstrip("/") or "/"
+            destination = PurePosixPath(target_dir_path).as_posix()
+            if destination == ".":
+                destination = "/"
+            target = rpc.find(destination)
+            if not target.isDirectory or target.isLocal or target.readOnly:
+                raise OSError(f"本地上传目标必须是可写网盘目录: {destination}")
+            target_name = new_name or local_path.name
+            target_path = (PurePosixPath(destination) / target_name).as_posix()
+            progress_callback = transfer_process(target_path)
+
+            def check_cancelled() -> None:
+                if global_vars.is_transfer_stopped(target_path):
+                    raise RemoteUploadCancelled(target_path)
+
+            uploader = LocalUpload(rpc, logger, check_cancelled, progress_callback)
+            final_path = uploader.run(
+                cd2_source_path,
+                destination,
+                target_name,
+                stat.st_size,
+                self.get_folder,
+            )
+            result = self.get_item(Path(final_path))
+            if not result:
+                raise OSError(f"CD2 本地上传完成但目标文件查询不到: {final_path}")
+            progress_callback(100)
+            return result
+        except RemoteUploadCancelled:
+            logger.info("【CloudDrive】本地上传已取消: %s", cd2_source_path)
+            return None
+        except Exception as e:
+            logger.error(
+                "【CloudDrive】CD2 本地上传失败（不自动切换远程重传）: source=%s error=%s",
+                cd2_source_path,
+                e,
+            )
+            return None
 
     def _upload_remote_upload(
         self,
