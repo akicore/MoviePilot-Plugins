@@ -925,7 +925,6 @@ class CloudDriveApi:
                 destination,
                 target_name,
                 stat.st_size,
-                self.get_folder,
             )
             result = self.get_item(Path(final_path))
             if not result:

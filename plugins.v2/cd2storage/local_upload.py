@@ -2,10 +2,9 @@
 
 from dataclasses import dataclass
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from time import monotonic, sleep
-from typing import Any, Callable, List, Optional
-from uuid import uuid4
+from typing import Any, Callable, List
 
 from grpc import RpcError, StatusCode
 from google.protobuf.empty_pb2 import Empty
@@ -87,11 +86,12 @@ class LocalUploadRpc:
         return result
 
     def copy(self, source: str, destination: str):
-        # A unique staging directory makes Skip a fail-safe, never an overwrite.
+        # Copy directly into the requested cloud folder and replace an existing
+        # same-name object, as MoviePilot has already decided the conflict policy.
         return self.checked(
             self.call("CopyFile", pb.CopyFileRequest(
                 theFilePaths=[source], destPath=destination,
-                conflictPolicy=pb.CopyFileRequest.Skip,
+                conflictPolicy=pb.CopyFileRequest.Overwrite,
             )), "CD2 CopyFile 失败",
         )
 
@@ -101,14 +101,16 @@ class LocalUploadRpc:
         ))
         return [file for reply in replies for file in reply.subFiles]
 
-    def cloud_file(self, path: str, size: int):
+    def cloud_file(self, path: str, size: int = None):
         # Force a provider listing instead of trusting FindFileByPath's cached
-        # upload placeholder. The per-upload staging directory is uniquely owned.
+        # upload placeholder.
         parent = PurePosixPath(path).parent.as_posix()
         for file in self.list_files(parent):
             if (file.name == PurePosixPath(path).name and file.id
                     and file.isCloudFile and not file.isLocal
-                    and not file.isDirectory and file.size == size):
+                    and not file.isDirectory
+                    and (size is None or file.size == size)):
+
                 return file
         return None
 
@@ -134,37 +136,17 @@ class LocalUploadRpc:
             theFilePath=path, newName=name,
         )), "CD2 RenameFile 失败")
 
-    def move(self, path: str, destination: str):
-        # Do not overwrite an existing final file. The isolated staging file is
-        # retained on conflict so that a concurrent upload cannot destroy data.
-        return self.checked(self.call("MoveFile", pb.MoveFileRequest(
-            theFilePaths=[path], destPath=destination,
-            conflictPolicy=pb.MoveFileRequest.Skip,
-        )), "CD2 MoveFile 失败")
-
-    def delete_empty_directory(self, path: str):
-        if self.list_files(path):
-            return  # Never recursively delete data, even after an error.
-        self.checked(self.call("DeleteFile", pb.FileRequest(path=path)), "删除空暂存目录失败")
-
-    def cancel(self, source: str, directory: str, destination: str, logger):
-        # Only our unique staging task, never all uploads or any MP source file.
+    def cancel(self, source: str, destination: str, logger):
+        # Cancel only an exact copy task. Upload tasks in a shared destination
+        # cannot be unambiguously attributed to this request.
         try:
             self.call("CancelCopyTask", pb.CopyTaskRequest(
-                sourcePath=source, destPath=directory,
+                sourcePath=source, destPath=destination,
             ))
         except Exception as error:
             logger.warning("【CloudDrive】取消本地复制任务失败: %s", error)
-        try:
-            matches = [
-                item for item in self.uploads(directory)
-                if item.key and item.destPath.rstrip("/") == directory.rstrip("/")
-            ]
-            keys = [item.key for item in matches]
-            if keys:
-                self.call("CancelUploadFiles", pb.MultpleUploadFileKeyRequest(keys=keys))
-        except Exception as error:
-            logger.warning("【CloudDrive】取消本地上传任务失败: %s", error)
+        # Upload-file tasks in a shared destination cannot be unambiguously
+        # attributed to one CopyFile request. Never cancel other files there.
 
 
 class LocalUpload:
@@ -183,7 +165,8 @@ class LocalUpload:
         self.interval = interval
         self.stall_timeout = stall_timeout
 
-    def _wait(self, source: str, directory: str, path: str, size: int):
+    def _wait(self, source: str, directory: str, path: str, size: int,
+              baseline_keys=None, baseline_file=None):
         deadline = monotonic() + self.timeout
         last_state = None
         last_activity = monotonic()
@@ -192,7 +175,10 @@ class LocalUpload:
         while monotonic() < deadline:
             self.check_cancelled()
             try:
-                uploads = self.rpc.uploads(directory)
+                uploads = [
+                    item for item in self.rpc.uploads(directory)
+                    if baseline_keys is None or item.key not in baseline_keys
+                ]
                 # File copies may not create a folder-copy task at all.
                 copies = [
                     task for task in self.rpc.copy_tasks()
@@ -233,7 +219,12 @@ class LocalUpload:
             copies_active = any(task.status != pb.CopyTask.Completed for task in copies)
             if not uploads_active and not copies_active:
                 file = self.rpc.cloud_file(path, size)
-                if file:
+                baseline_changed = baseline_file is None or (
+                    file is not None
+                    and (file.id, file.writeTime.SerializeToString())
+                    != (baseline_file.id, baseline_file.writeTime.SerializeToString())
+                )
+                if file and baseline_changed:
                     if uploads_done or copies_done or quiet_cloud_id == file.id:
                         self.logger.info("【CloudDrive】本地上传云端校验完成: %s size=%d", path, size)
                         return
@@ -270,67 +261,58 @@ class LocalUpload:
             self.check_cancelled()
             sleep(min(0.1, max(0, until - monotonic())))
 
-    def run(self, source: str, destination: str, name: str, size: int,
-            create_directory: Callable[[Path], Any]) -> str:
+    def run(self, source: str, destination: str, name: str, size: int) -> str:
         destination = normalize_path(destination)
         if not name or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
             raise ValueError("非法的本地上传目标文件名")
         final_path = (PurePosixPath(destination) / name).as_posix()
-        directory = (PurePosixPath(destination) / f".cd2storage-{uuid4().hex}").as_posix()
-        copied_path = (PurePosixPath(directory) / PurePosixPath(source).name).as_posix()
+        copied_path = (PurePosixPath(destination) / PurePosixPath(source).name).as_posix()
         self.check_cancelled()
-        if any(file.name == name for file in self.rpc.list_files(destination)):
-            raise FileExistsError(f"目标文件已存在，拒绝覆盖: {final_path}")
-        if not create_directory(Path(directory)):
-            raise OSError(f"无法创建本地上传暂存目录: {directory}")
         submitted = False
-        published = False
         try:
             self.check_cancelled()
-            # Record before the RPC: a deadline/network failure has unknown outcome.
+            # Snapshot existing upload keys and destination metadata so a prior
+            # completed task/file cannot be mistaken for this overwrite.
+            baseline_keys = {
+                item.key for item in self.rpc.uploads(destination) if item.key
+            }
+            baseline_file = self.rpc.cloud_file(copied_path)
+            # CopyFile accepts a destination directory, not a destination
+            # filename. For the normal same-name case this writes the final
+            # path directly; only a requested MP rename needs RenameFile later.
             submitted = True
-            response = self.rpc.copy(source, directory)
+            response = self.rpc.copy(source, destination)
             if response.resultFilePaths and list(response.resultFilePaths) != [copied_path]:
                 raise OSError(f"CD2 CopyFile 返回非预期路径: {list(response.resultFilePaths)}")
-            self.logger.info("【CloudDrive】已提交本地上传: source=%s staging=%s final=%s",
+            self.logger.info("【CloudDrive】已直接提交本地上传: source=%s dest=%s final=%s",
                              source, copied_path, final_path)
-            self._wait(source, directory, copied_path, size)
+            self._wait(
+                source, destination, copied_path, size,
+                baseline_keys=baseline_keys,
+                baseline_file=baseline_file,
+            )
             self.check_cancelled()
-            if PurePosixPath(copied_path).name != name:
+            if copied_path != final_path:
                 renamed = self.rpc.rename(copied_path, name)
-                copied_path = (PurePosixPath(directory) / name).as_posix()
-                if renamed.resultFilePaths and list(renamed.resultFilePaths) != [copied_path]:
+                if renamed.resultFilePaths and list(renamed.resultFilePaths) != [final_path]:
                     raise OSError("CD2 RenameFile 返回非预期路径")
-            self.check_cancelled()
-            # Check for existing files, then Skip handles races in the move RPC.
-            if any(file.name == name for file in self.rpc.list_files(destination)):
-                raise FileExistsError(f"目标文件已存在，保留云端暂存文件: {final_path}")
-            moved = self.rpc.move(copied_path, destination)
-            if moved.resultFilePaths and list(moved.resultFilePaths) != [final_path]:
-                raise OSError("CD2 MoveFile 返回非预期路径")
-            # resultFilePaths can be empty. A skipped move leaves our staging
-            # file in place; do not mistake a pre-existing destination for ours.
-            deadline = monotonic() + 30
-            while monotonic() < deadline:
-                self.check_cancelled()
-                remaining = self.rpc.list_files(directory)
-                file = self.rpc.cloud_file(final_path, size)
-                if not remaining and file:
-                    published = True
-                    return final_path
-                self._pause(deadline)
-            raise OSError("CD2 MoveFile 未确认移走暂存文件或最终文件未通过云端校验")
+                # Confirm the requested name is visible and complete.
+                deadline = monotonic() + 30
+                while monotonic() < deadline:
+                    self.check_cancelled()
+                    file = self.rpc.cloud_file(final_path, size)
+                    if file:
+                        self.progress(100)
+                        return final_path
+                    self._pause(deadline)
+                raise OSError("CD2 重命名后最终文件未通过云端校验")
+            self.progress(100)
+            return final_path
         except BaseException:
             if submitted:
-                self.rpc.cancel(source, directory, copied_path, self.logger)
+                self.rpc.cancel(source, destination, self.logger)
                 self.logger.warning(
-                    "【CloudDrive】本地上传未确认完成，不回退重传；保留云端暂存目录供检查: %s", directory,
+                    "【CloudDrive】本地上传未确认完成，不回退重传；CD2 目标路径=%s",
+                    final_path,
                 )
             raise
-        finally:
-            # Empty-only cleanup. Failure/cancellation never deletes uploaded data.
-            if published or not submitted:
-                try:
-                    self.rpc.delete_empty_directory(directory)
-                except Exception as error:
-                    self.logger.warning("【CloudDrive】清理空暂存目录失败: %s - %s", directory, error)
