@@ -17,7 +17,10 @@ from app.schemas.exception import StorageQueryError
 from clouddrive2_client import CloudDriveClient
 from clouddrive2_client.proto import clouddrive_pb2
 
-from .local_upload import LocalPathMapping, LocalUpload, LocalUploadRpc, match_local_path
+from .folder_manager import FolderManager
+from .local_upload import (
+    LocalPathMapping, LocalUpload, LocalUploadRpc, match_local_path, normalize_path,
+)
 from .remote_channel import RemoteUploadChannel
 from .remote_hash import HashResult, RemoteHashCache, RemoteHashDispatcher
 from .remote_upload import ReadResult, RemoteReadDispatcher, RemoteUploadCancelled
@@ -135,6 +138,7 @@ class CloudDriveApi:
         :param upload_mode (str): 上传模式
         """
         self.client = client
+        self._folders = FolderManager(client, logger)
         self._disk_name = disk_name
         self._download_base = (download_base or "http://127.0.0.1:19798").rstrip("/")
         self._upload_mode = upload_mode
@@ -291,75 +295,36 @@ class CloudDriveApi:
 
         :return FileItem: 新目录的 FileItem，失败返回 None
         """
-        parent_path = (fileitem.path or "").rstrip("/") or "/"
         try:
-            result = self.client.create_folder(parent_path, name)
-        except Exception as e:
-            logger.error("【CloudDrive】创建文件夹失败 %s/%s: %s", parent_path, name, e)
-            return None
-        if not result or not result.result or not result.result.success:
-            return None
-        if result.folderCreated and result.folderCreated.id:
+            folder = self._folders.ensure(fileitem.path or "/", name)
             return _cloudfile_to_fileitem(
-                result.folderCreated, self._disk_name, parent_fileid=fileitem.fileid
+                folder, self._disk_name, parent_fileid=fileitem.fileid
             )
-        new_path = f"{parent_path.rstrip('/')}/{name}/"
-        return self.get_item(Path(new_path))
+        except Exception as e:
+            logger.error(
+                "【CloudDrive】获取或创建目录失败: parent=%s name=%s error=%s",
+                fileitem.path, name, e,
+            )
+            return None
 
     def get_folder(self, path: Path) -> Optional[FileItem]:
-        """
-        获取目录，如目录不存在则逐级创建
-
-        :param path (Path): 目录路径
-
-        :return FileItem: 目录文件项，若创建失败则返回 None
-        """
-        normalized = path.as_posix().rstrip("/") or "/"
-        if normalized != "/":
-            folder = self.get_item(Path(normalized))
-            if folder:
-                return folder
-
-        def __find_dir(parent: FileItem, name: str) -> Optional[FileItem]:
-            for sub in self.list(parent):
-                if sub.type != "dir":
-                    continue
-                if sub.name == name:
-                    return sub
+        """Resolve every component through the same guarded create entry point."""
+        try:
+            normalized = normalize_path(path.as_posix())
+        except ValueError as e:
+            logger.error("【CloudDrive】非法目录路径 %s: %s", path, e)
             return None
-
-        root = self.get_item(Path("/"))
-        if not root:
-            root = FileItem(
-                storage=self._disk_name,
-                fileid="",
-                parent_fileid=None,
-                name="",
-                basename="",
-                extension=None,
-                type="dir",
-                path="/",
-                size=None,
-                modify_time=None,
-            )
-        fileitem = root
-        parts = path.parts[1:] if path.parts[0] == "/" else path.parts
-        for part in parts:
-            if not part or part == ".":
-                continue
-            dir_file = __find_dir(fileitem, part)
-            if dir_file:
-                fileitem = dir_file
-            else:
-                dir_file = self.create_folder(fileitem, part)
-                if not dir_file:
-                    logger.error(
-                        "【CloudDrive】创建目录 %s%s 失败",
-                        fileitem.path,
-                        part,
-                    )
-                    return None
-                fileitem = dir_file
+        # CD2's virtual root need not have a provider ID. Listing it still has
+        # to succeed before ensure() can resolve/create a child.
+        fileitem = FileItem(
+            storage=self._disk_name, fileid="", parent_fileid=None,
+            name="", basename="", extension=None, type="dir", path="/",
+            size=None, modify_time=None,
+        )
+        for part in PurePosixPath(normalized).parts[1:]:
+            fileitem = self.create_folder(fileitem, part)
+            if fileitem is None:
+                return None
         return fileitem
 
     def detail(self, fileitem: FileItem) -> Optional[FileItem]:
@@ -903,6 +868,15 @@ class CloudDriveApi:
             if destination == ".":
                 destination = "/"
             target = rpc.find(destination)
+            if normalize_path(target.fullPathName) != destination:
+                raise OSError(
+                    f"CD2 返回非预期上传目录: expected={destination} "
+                    f"actual={target.fullPathName} id={target.id}"
+                )
+            logger.info(
+                "【CloudDrive】本地上传目标确认: path=%s id=%s",
+                destination, target.id,
+            )
             # `readOnly` is present in newer CD2 schemas, but the bundled
             # clouddrive2-client protobuf may predate that field.
             if (
@@ -927,8 +901,9 @@ class CloudDriveApi:
                 stat.st_size,
             )
             result = self.get_item(Path(final_path))
-            if not result:
-                raise OSError(f"CD2 本地上传完成但目标文件查询不到: {final_path}")
+            if (not result or result.type != "file" or result.size != stat.st_size
+                    or normalize_path(result.path) != final_path):
+                raise OSError(f"CD2 本地上传完成但目标文件未通过最终校验: {final_path}")
             progress_callback(100)
             return result
         except RemoteUploadCancelled:

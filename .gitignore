@@ -1,6 +1,7 @@
 __pycache__/
 /dist/
-/tests/
+/tests/*
+!/tests/test_cd2storage_safety.py
 
 *.exe
 *.dll

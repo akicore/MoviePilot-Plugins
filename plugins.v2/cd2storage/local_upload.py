@@ -4,13 +4,11 @@ from dataclasses import dataclass
 import json
 from pathlib import PurePosixPath
 from time import monotonic, sleep
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 
 from grpc import RpcError, StatusCode
 from google.protobuf.empty_pb2 import Empty
 from clouddrive2_client.proto import clouddrive_pb2 as pb
-
-from .remote_upload import RemoteUploadCancelled
 
 
 def normalize_path(value: Any) -> str:
@@ -101,31 +99,36 @@ class LocalUploadRpc:
         ))
         return [file for reply in replies for file in reply.subFiles]
 
-    def cloud_file(self, path: str, size: int = None):
-        # Force a provider listing instead of trusting FindFileByPath's cached
-        # upload placeholder.
+    def cloud_file(self, path: str, size: Optional[int] = None):
+        # Refresh the provider listing; reject ambiguous or redirected objects.
+        path = normalize_path(path)
         parent = PurePosixPath(path).parent.as_posix()
-        for file in self.list_files(parent):
-            if (file.name == PurePosixPath(path).name and file.id
-                    and file.isCloudFile and not file.isLocal
-                    and not file.isDirectory
-                    and (size is None or file.size == size)):
-
-                return file
+        matches = [file for file in self.list_files(parent)
+                   if file.name == PurePosixPath(path).name]
+        if len(matches) > 1:
+            raise OSError(f"CD2 云端文件同名，无法确认本次上传: {path}")
+        if not matches:
+            return None
+        file = matches[0]
+        if normalize_path(file.fullPathName) != path:
+            raise OSError(f"CD2 返回非预期云端文件: expected={path} actual={file.fullPathName}")
+        if (file.id and file.isCloudFile and not file.isLocal
+                and not file.isDirectory and (size is None or file.size == size)):
+            return file
         return None
 
-    def uploads(self, destination: str):
-        """Use bounded pages; do not assume undocumented server filter semantics."""
+    def uploads(self, path: str):
+        """Match this file's full path, independently of server search filters."""
+        path = normalize_path(path)
         result = []
         for page in range(100):
             response = self.call("GetUploadFileList", pb.GetUploadFileListRequest(
-                getAll=False, itemsPerPage=100, pageNumber=page, filter=destination,
+                getAll=False, itemsPerPage=100, pageNumber=page,
             ))
-            # `filter` is the API's search filter; confirm exact destination
-            # locally so similar names (/stage and /stage-old) never mix.
-            result.extend(response.uploadFiles)
+            result.extend(item for item in response.uploadFiles
+                          if item.destPath.rstrip("/") == path)
             if len(response.uploadFiles) < 100 or (page + 1) * 100 >= response.totalCount:
-                return [item for item in result if item.destPath.rstrip("/") == destination.rstrip("/")]
+                return result
         raise OSError("CD2 上传列表分页超过安全上限")
 
     def copy_tasks(self):
@@ -165,26 +168,50 @@ class LocalUpload:
         self.interval = interval
         self.stall_timeout = stall_timeout
 
+    @staticmethod
+    def _upload_state(item):
+        return (item.statusEnum, item.transferedBytes, item.size, item.errorMessage)
+
+    def _matching_copies(self, source, directory, path):
+        return [task for task in self.rpc.copy_tasks()
+                if task.sourcePath.rstrip("/") == source
+                and task.destPath.rstrip("/") in (directory, path)]
+
     def _wait(self, source: str, directory: str, path: str, size: int,
-              baseline_keys=None, baseline_file=None):
+              baseline_uploads=None, baseline_copies=None, baseline_file=None):
         deadline = monotonic() + self.timeout
         last_state = None
         last_activity = monotonic()
         last_log = 0.0
         quiet_cloud_id = None
+        observed_uploads = set()
+        observed_copies = set()
         while monotonic() < deadline:
             self.check_cancelled()
             try:
-                uploads = [
-                    item for item in self.rpc.uploads(directory)
-                    if baseline_keys is None or item.key not in baseline_keys
-                ]
-                # File copies may not create a folder-copy task at all.
-                copies = [
-                    task for task in self.rpc.copy_tasks()
-                    if task.sourcePath.rstrip("/") == source
-                    and task.destPath.rstrip("/") in (directory, path)
-                ]
+                # A reused key must not hide an active task. Ignore only
+                # terminal records that are unchanged since before submission.
+                terminal = (
+                    pb.UploadFileInfo.Finish, pb.UploadFileInfo.Cancelled,
+                    pb.UploadFileInfo.Error, pb.UploadFileInfo.FatalError,
+                    pb.UploadFileInfo.Ignored, pb.UploadFileInfo.Skipped,
+                )
+                uploads = []
+                for item in self.rpc.uploads(path):
+                    if (baseline_uploads is None or item.key in observed_uploads
+                            or item.statusEnum not in terminal
+                            or baseline_uploads.get(item.key) != self._upload_state(item)):
+                        uploads.append(item)
+                        observed_uploads.add(item.key)
+                copies = []
+                for task in self._matching_copies(source, directory, path):
+                    identity = (task.sourcePath, task.destPath,
+                                task.startTime.SerializeToString())
+                    if (baseline_copies is None or identity in observed_copies
+                            or task.status not in (pb.CopyTask.Completed, pb.CopyTask.Failed)
+                            or task.SerializeToString() not in baseline_copies):
+                        copies.append(task)
+                        observed_copies.add(identity)
             except RpcError as error:
                 if error.code() not in (StatusCode.UNAVAILABLE, StatusCode.DEADLINE_EXCEEDED):
                     raise
@@ -224,11 +251,15 @@ class LocalUpload:
                     and (file.id, file.writeTime.SerializeToString())
                     != (baseline_file.id, baseline_file.writeTime.SerializeToString())
                 )
-                if file and baseline_changed:
-                    if uploads_done or copies_done or quiet_cloud_id == file.id:
-                        self.logger.info("【CloudDrive】本地上传云端校验完成: %s size=%d", path, size)
+                if file and (uploads_done or copies_done or baseline_changed):
+                    signature = (file.id, file.size, file.writeTime.SerializeToString())
+                    if uploads_done or copies_done or quiet_cloud_id == signature:
+                        self.logger.info(
+                            "【CloudDrive】本地上传云端校验完成: path=%s id=%s size=%d",
+                            path, file.id, size,
+                        )
                         return
-                    quiet_cloud_id = file.id
+                    quiet_cloud_id = signature
                 else:
                     quiet_cloud_id = None
             else:
@@ -273,8 +304,13 @@ class LocalUpload:
             self.check_cancelled()
             # Snapshot existing upload keys and destination metadata so a prior
             # completed task/file cannot be mistaken for this overwrite.
-            baseline_keys = {
-                item.key for item in self.rpc.uploads(destination) if item.key
+            baseline_uploads = {
+                item.key: self._upload_state(item)
+                for item in self.rpc.uploads(copied_path)
+            }
+            baseline_copies = {
+                task.SerializeToString()
+                for task in self._matching_copies(source, destination, copied_path)
             }
             baseline_file = self.rpc.cloud_file(copied_path)
             # CopyFile accepts a destination directory, not a destination
@@ -288,7 +324,8 @@ class LocalUpload:
                              source, copied_path, final_path)
             self._wait(
                 source, destination, copied_path, size,
-                baseline_keys=baseline_keys,
+                baseline_uploads=baseline_uploads,
+                baseline_copies=baseline_copies,
                 baseline_file=baseline_file,
             )
             self.check_cancelled()
