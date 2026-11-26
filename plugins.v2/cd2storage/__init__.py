@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, cast
+from uuid import uuid4
 
 from clouddrive2_client import CloudDriveClient
 
@@ -88,9 +89,6 @@ class CD2Storage(_PluginBase):
             ),
         )
 
-        self._client = None
-        self._clouddrive_api = None
-
         # Close the previous client before applying the new configuration.
         self.stop_service()
 
@@ -114,12 +112,17 @@ class CD2Storage(_PluginBase):
             # API tokens are already-issued bearer tokens; do not exchange credentials.
             self._client.jwt_token = self._token
             download_base = f"http://{self._host}:{self._port}"
+            remote_device_id = self.get_data("remote_upload_device_id")
+            if not isinstance(remote_device_id, str) or not remote_device_id.strip():
+                remote_device_id = f"moviepilot-{uuid4().hex}"
+                self.save_data("remote_upload_device_id", remote_device_id)
             self._clouddrive_api = CloudDriveApi(
                 self._client,
                 disk_name=self._disk_name,
                 download_base=download_base,
                 upload_mode=self._upload_mode,
                 upload_balancer=self._upload_balancer,
+                remote_device_id=remote_device_id,
             )
         except Exception as e:
             logger.error("【CloudDrive】客户端创建失败: %s", e)
@@ -718,6 +721,8 @@ class CD2Storage(_PluginBase):
         """
         退出插件
         """
+        if self._clouddrive_api:
+            self._clouddrive_api.close()
         if self._client:
             try:
                 self._client.close()

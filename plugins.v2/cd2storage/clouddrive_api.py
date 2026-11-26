@@ -1,10 +1,8 @@
 from enum import IntEnum
 from pathlib import Path, PurePosixPath
-from queue import Empty, Full, Queue
-from threading import Event, Thread
 from time import monotonic, sleep
-from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
-from uuid import uuid4
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from uuid import NAMESPACE_DNS, getnode, uuid4, uuid5
 
 from cryptography.hazmat.primitives import hashes
 from grpc import Call, RpcError, StatusCode
@@ -20,6 +18,7 @@ from app.schemas.exception import StorageQueryError
 from clouddrive2_client import CloudDriveClient
 from clouddrive2_client.proto import clouddrive_pb2
 
+from .remote_channel import RemoteUploadChannel
 from .remote_upload import ReadResult, RemoteReadDispatcher, RemoteUploadCancelled
 from .upload_balancer import UploadBalancer
 
@@ -67,7 +66,10 @@ class UploadStatus(IntEnum):
         FATAL_ERROR: 致命错误
     """
 
+    CANCELLED = 2
     FINISH = 5
+    SKIPPED = 6
+    IGNORED = 8
     ERROR = 9
     FATAL_ERROR = 10
 
@@ -135,6 +137,7 @@ class CloudDriveApi:
         download_base: Optional[str] = None,
         upload_mode: Literal["remote_upload", "direct_write"] = "direct_write",
         upload_balancer: Optional[UploadBalancer] = None,
+        remote_device_id: Optional[str] = None,
     ) -> None:
         """
         初始化 CloudDrive API 封装
@@ -149,7 +152,17 @@ class CloudDriveApi:
         self._download_base = (download_base or "http://127.0.0.1:19798").rstrip("/")
         self._upload_mode = upload_mode
         self._upload_balancer = upload_balancer
+        self._remote_channel = RemoteUploadChannel(
+            client,
+            remote_device_id
+            or f"moviepilot-{uuid5(NAMESPACE_DNS, f'{getnode()}:{disk_name}')}",
+            logger,
+        )
         self.transtype = {"move": "移动", "copy": "复制"}
+
+    def close(self) -> None:
+        """Stop the shared request channel before closing its gRPC client."""
+        self._remote_channel.close()
 
     def list(self, fileitem: FileItem) -> List[FileItem]:
         """
@@ -882,66 +895,6 @@ class CloudDriveApi:
                         progress_callback(bytes_hashed, total_bytes)
         return file_md5.finalize().hex(), blocks
 
-    @staticmethod
-    def _iter_stream_with_timeout(
-        stream,
-        timeout: int = 300,
-        check_callback: Optional[Callable[[], None]] = None,
-    ) -> Iterator:
-        """Bound queued requests; poll read failures/cancellation while idle."""
-        q: Queue = Queue(maxsize=16)
-        stopped = Event()
-        sentinel = object()
-
-        def _put(item) -> bool:
-            while not stopped.is_set():
-                try:
-                    q.put(item, timeout=0.1)
-                    return True
-                except Full:
-                    pass
-            return False
-
-        def _reader() -> None:
-            try:
-                for msg in stream:
-                    if not _put(msg):
-                        return
-                _put(sentinel)
-            except Exception as e:
-                _put(e)
-
-        reader = Thread(target=_reader, daemon=True, name="cd2-stream-reader")
-        reader.start()
-        try:
-            while True:
-                deadline = monotonic() + timeout
-                while True:
-                    if check_callback:
-                        check_callback()
-                    remaining = deadline - monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            f"gRPC 流超时：{timeout} 秒内未收到服务端消息"
-                        )
-                    try:
-                        item = q.get(timeout=min(0.1, remaining))
-                        break
-                    except Empty:
-                        pass
-                if item is sentinel:
-                    return
-                if isinstance(item, BaseException):
-                    raise item
-                yield item
-        finally:
-            stopped.set()
-            try:
-                stream.cancel()
-            except Exception:
-                pass
-            reader.join(timeout=1)
-
     def _cancel_upload(self, upload_id: str) -> None:
         """
         安全取消远程上传会话，忽略取消过程中的异常
@@ -1315,25 +1268,26 @@ class CloudDriveApi:
         :return FileItem: 上传成功返回 FileItem，失败返回 None
         """
         progress_callback = transfer_process(target_path)
-        stream = None
+        session = None
         replies = None
         reads = None
         upload_id = None
         upload_finished = False
         try:
-            stream = self.client.remote_upload_channel(
-                device_id=f"moviepilot-{uuid4().hex[:12]}"
+            session = self._remote_channel.start(
+                target_path,
+                lambda: self.client.start_remote_upload(
+                    file_path=target_path,
+                    file_size=file_size,
+                    known_hashes=precomputed_hashes,
+                    client_can_calculate_hashes=True,
+                ),
             )
-            stream.initial_metadata()
-            started = self.client.start_remote_upload(
-                file_path=target_path,
-                file_size=file_size,
-                known_hashes=precomputed_hashes,
-                client_can_calculate_hashes=True,
-            )
-            upload_id = started.upload_id
+            upload_id = session.upload_id
 
             def _check_cancelled() -> None:
+                if session.error is not None:
+                    raise session.error
                 if global_vars.is_transfer_stopped(target_path):
                     raise RemoteUploadCancelled(target_path)
 
@@ -1356,7 +1310,16 @@ class CloudDriveApi:
                     request, metadata=metadata, timeout=120
                 )
 
+            data_completed_logged = False
+
             def _on_read_result(result: ReadResult) -> None:
+                nonlocal data_completed_logged
+                if not data_completed_logged and reads.completed_bytes == file_size:
+                    data_completed_logged = True
+                    logger.info(
+                        "【CloudDrive】源文件数据已回传，等待CD2完成: upload=%s path=%s bytes=%d",
+                        upload_id, target_path, file_size,
+                    )
                 logger.debug(
                     "【CloudDrive】RemoteReadData: upload=%s offset=%d bytes=%d "
                     "read_ms=%.3f rpc_ms=%.3f",
@@ -1376,23 +1339,54 @@ class CloudDriveApi:
                 _on_read_result,
             )
             logger.info(
-                "【CloudDrive】远程上传取数: upload=%s workers=%d buffer_bytes=%d",
+                "【CloudDrive】远程上传取数: upload=%s path=%s workers=%d buffer_bytes=%d",
                 upload_id,
+                target_path,
                 reads.MAX_WORKERS,
                 reads.MAX_BUFFER_BYTES,
             )
-            replies = self._iter_stream_with_timeout(
-                stream, timeout=300, check_callback=reads.poll
-            )
+            last_report = monotonic()
+
+            def _poll_upload() -> None:
+                nonlocal last_report
+                reads.poll()
+                now = monotonic()
+                if now - last_report >= 15:
+                    last_report = now
+                    logger.info(
+                        "【CloudDrive】远程上传等待/进度: upload=%s path=%s "
+                        "received=%d queued=%d completed=%d unique_bytes=%d/%d "
+                        "pending=%d max_parallel_rpcs=%d last_message_ago=%.1fs",
+                        upload_id,
+                        target_path,
+                        session.received,
+                        session.queue.qsize(),
+                        reads.completed_requests,
+                        reads.completed_bytes,
+                        file_size,
+                        reads.pending_count,
+                        reads.max_active_rpcs,
+                        now - session.last_received,
+                    )
+
+            replies = session.messages(_poll_upload, timeout=300)
             for reply in replies:
                 _check_cancelled()
                 which = reply.WhichOneof("request")
                 if not which:
                     continue
-                if reply.upload_id != upload_id:
-                    continue
                 if which == "read_data":
                     req = reply.read_data
+                    logger.debug(
+                        "【CloudDrive】收到远程取数请求: upload=%s path=%s "
+                        "offset=%d length=%d lazy_read=%s pending=%d",
+                        upload_id,
+                        target_path,
+                        req.offset,
+                        req.length,
+                        getattr(req, "lazy_read", False),
+                        reads.pending_count,
+                    )
                     reads.submit(
                         req.offset, req.length, getattr(req, "lazy_read", False)
                     )
@@ -1473,13 +1467,23 @@ class CloudDriveApi:
                         return None
                 elif which == "status_changed":
                     st = reply.status_changed.status
-                    if st == UploadStatus.FINISH:
+                    logger.info(
+                        "【CloudDrive】远程上传状态: upload=%s path=%s status=%s",
+                        upload_id, target_path, st,
+                    )
+                    if st in (UploadStatus.FINISH, UploadStatus.SKIPPED):
                         reads.finish()
                         progress_callback(100)
                         upload_finished = True
-                        logger.info(f"【CloudDrive】上传完成状态码: {st}")
+                        logger.info(
+                            "【CloudDrive】上传完成: upload=%s path=%s status=%s",
+                            upload_id, target_path, st,
+                        )
                         break
-                    if st in (UploadStatus.ERROR, UploadStatus.FATAL_ERROR):
+                    if st in (
+                        UploadStatus.CANCELLED, UploadStatus.IGNORED,
+                        UploadStatus.ERROR, UploadStatus.FATAL_ERROR,
+                    ):
                         msg = reply.status_changed.error_message or "上传失败"
                         logger.error("【CloudDrive】上传状态错误: %s", msg)
                         return None
@@ -1487,29 +1491,33 @@ class CloudDriveApi:
             logger.info("【CloudDrive】上传已取消: %s", target_path)
             return None
         except TimeoutError as e:
-            logger.warning("【CloudDrive】上传流超时: %s", e)
+            logger.warning(
+                "【CloudDrive】上传流超时: upload=%s path=%s error=%s",
+                upload_id, target_path, e,
+            )
             return None
         except Exception as e:
-            logger.error("【CloudDrive】上传过程异常: %s", e)
+            logger.error(
+                "【CloudDrive】上传过程异常: upload=%s path=%s error=%s",
+                upload_id, target_path, e,
+            )
             return None
         finally:
             if reads is not None:
                 reads.close()
                 logger.info(
-                    "【CloudDrive】远程取数结束: upload=%s requests=%d "
+                    "【CloudDrive】远程取数结束: upload=%s path=%s requests=%d "
                     "unique_bytes=%d max_parallel_rpcs=%d",
                     upload_id,
+                    target_path,
                     reads.completed_requests,
                     reads.completed_bytes,
                     reads.max_active_rpcs,
                 )
             if replies is not None:
                 replies.close()
-            elif stream is not None:
-                try:
-                    stream.cancel()
-                except Exception:
-                    pass
+            if session is not None:
+                self._remote_channel.release(session)
             if upload_id and not upload_finished:
                 self._cancel_upload(upload_id)
         if not upload_finished:

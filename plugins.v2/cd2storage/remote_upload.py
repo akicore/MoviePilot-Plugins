@@ -63,6 +63,10 @@ class RemoteReadDispatcher:
             max_workers=self.MAX_WORKERS, thread_name_prefix="cd2-remote-read"
         )
 
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
     @staticmethod
     def _file_signature(stat) -> Tuple[int, int, int, int]:
         return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns

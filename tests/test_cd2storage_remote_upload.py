@@ -402,6 +402,7 @@ class UploadIntegrationTests(RemoteReadFixture):
             remote_upload_control_cancel=Mock(),
         )
         api = api_module.CloudDriveApi(client, "test", upload_mode="remote_upload")
+        self.addCleanup(api.close)
         api.get_item = Mock(return_value="uploaded-item")
         api_module.transfer_process = lambda path: self.progress.append
         api_module.global_vars = SimpleNamespace(
@@ -426,6 +427,8 @@ class UploadIntegrationTests(RemoteReadFixture):
             self.assertEqual(upload.result(timeout=3), "uploaded-item")
         self.assertEqual(self.progress[-1], 100)
         client.remote_upload_control_cancel.assert_not_called()
+        self.assertFalse(stream.cancelled.is_set())
+        api.close()
         self.assertTrue(stream.cancelled.is_set())
         self.assertFalse(
             any(thread.name.startswith("cd2-") for thread in list_threads())
@@ -445,7 +448,7 @@ class UploadIntegrationTests(RemoteReadFixture):
         client.remote_upload_control_cancel.assert_called_once_with("upload-test")
         self.assertTrue(self.transport.calls[1][4].cancelled())
         self.assertNotIn(100, self.progress)
-        self.assertTrue(stream.cancelled.is_set())
+        self.assertFalse(stream.cancelled.is_set())
 
     def test_cancellation_is_detected_while_stream_is_idle(self):
         api, stream, client = self.make_api()
@@ -460,30 +463,6 @@ class UploadIntegrationTests(RemoteReadFixture):
         self.assertTrue(self.transport.calls[0][4].cancelled())
         client.remote_upload_control_cancel.assert_called_once_with("upload-test")
         self.assertNotIn(100, self.progress)
-
-    def test_stream_timeout_cancels_reader(self):
-        stream = Stream()
-        messages = api_module.CloudDriveApi._iter_stream_with_timeout(
-            stream, timeout=0.05
-        )
-        with self.assertRaises(TimeoutError):
-            next(messages)
-        self.assertTrue(stream.cancelled.is_set())
-        self.assertFalse(
-            any(thread.name == "cd2-stream-reader" for thread in list_threads())
-        )
-
-    def test_closing_full_request_queue_stops_reader(self):
-        stream = Stream()
-        for offset in range(100):
-            stream.read(offset, 1)
-        messages = api_module.CloudDriveApi._iter_stream_with_timeout(stream)
-        next(messages)
-        messages.close()
-        self.assertTrue(stream.cancelled.is_set())
-        self.assertFalse(
-            any(thread.name == "cd2-stream-reader" for thread in list_threads())
-        )
 
 
 if __name__ == "__main__":
