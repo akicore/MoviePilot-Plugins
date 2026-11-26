@@ -6,6 +6,7 @@ import importlib.util
 import logging
 from pathlib import Path, PurePosixPath
 import sys
+from tempfile import TemporaryDirectory
 from threading import Barrier, Lock
 from types import ModuleType, SimpleNamespace
 import unittest
@@ -46,10 +47,11 @@ def load_api():
     sys.modules[name] = module
     with patch.dict(sys.modules, modules):
         spec.loader.exec_module(module)
-    return module
+        balance = importlib.import_module(f"{PACKAGE}.upload_balancer")
+    return module, balance
 
 
-api_module = load_api()
+api_module, balance_module = load_api()
 
 
 def directory(path, id=None):
@@ -95,6 +97,47 @@ class DirectoryClient:
             return pb.CreateFolderResult(
                 result=pb.FileOperationResult(success=True),
                 folderCreated=self.files[actual],
+            )
+
+
+class AliasDirectoryClient:
+    """Two CD2 mount paths backed by one provider directory tree."""
+    def __init__(self, lag=False):
+        self.guard = Lock()
+        self.prefixes = ("/abc1", "/abc2")
+        self.hidden_prefixes = set()
+        self.files = {}
+        self.creates = []
+        self.lag = lag
+
+    def split(self, path):
+        for prefix in self.prefixes:
+            if path == prefix or path.startswith(prefix + "/"):
+                return prefix, path[len(prefix):]
+        raise OSError(f"unmapped directory: {path}")
+
+    def get_sub_files(self, path, force_refresh=False):
+        with self.guard:
+            if path == "/":
+                return [directory(prefix, "mount:" + prefix) for prefix in self.prefixes]
+            prefix, suffix = self.split(path)
+            if suffix and suffix not in self.files:
+                raise OSError(f"missing parent: {path}")
+            return [directory(prefix + child, id)
+                    for child, id in self.files.items()
+                    if PurePosixPath(child).parent.as_posix() == (suffix or "/")
+                    and not self.lag and prefix not in self.hidden_prefixes]
+
+    def create_folder(self, parent, name):
+        with self.guard:
+            prefix, suffix = self.split(parent)
+            child = suffix + "/" + name
+            self.creates.append(prefix + child)
+            actual = child if child not in self.files else child + "(1)"
+            self.files[actual] = "remote:" + actual
+            return pb.CreateFolderResult(
+                result=pb.FileOperationResult(success=True),
+                folderCreated=directory(prefix + actual, self.files[actual]),
             )
 
 
@@ -211,6 +254,271 @@ class DirectoryTests(unittest.TestCase):
         client.get_sub_files.return_value = [directory("/cloud/Series")]
         self.assertEqual(manager.ensure("/cloud", "Series").id, "/cloud/Series")
         client.create_folder.assert_called_once()
+
+
+class SharedDirectoryTests(unittest.TestCase):
+    def manager(self, client):
+        return FolderManager(client, LOGGER, shared_groups=[("/abc1", "/abc2")])
+
+    def test_parallel_first_creation_through_both_aliases(self):
+        for lag in (False, True):
+            with self.subTest(lag=lag):
+                client = AliasDirectoryClient(lag=lag)
+                manager = self.manager(client)
+                ready = Barrier(12)
+
+                def get(i):
+                    ready.wait(timeout=3)
+                    prefix = "/abc1" if i % 2 else "/abc2"
+                    return manager.ensure(prefix, "Series")
+
+                with ThreadPoolExecutor(max_workers=12) as pool:
+                    results = list(pool.map(get, range(12)))
+                self.assertEqual(len(client.creates), 1)
+                self.assertEqual({file.id for file in results}, {"remote:/Series"})
+                self.assertEqual({file.fullPathName for file in results},
+                                 {"/abc1/Series", "/abc2/Series"})
+                self.assertEqual(manager._locks, {})
+
+    def test_peer_listing_prevents_duplicate_after_cache_expiry_or_restart(self):
+        for reset in (False, True):
+            with self.subTest(reset=reset):
+                client = AliasDirectoryClient()
+                manager = self.manager(client)
+                manager.ensure("/abc1", "Series")
+                if reset:
+                    manager = self.manager(client)
+                else:
+                    manager._recent.clear()
+                client.hidden_prefixes.add("/abc2")
+                result = manager.ensure("/abc2", "Series")
+                self.assertEqual(result.id, "remote:/Series")
+                self.assertEqual(result.fullPathName, "/abc2/Series")
+                self.assertEqual(client.creates, ["/abc1/Series"])
+
+    def test_cached_alias_projection_does_not_change_original_proto(self):
+        client = AliasDirectoryClient(lag=True)
+        manager = self.manager(client)
+        first = manager.ensure("/abc1", "Series")
+        second = manager.ensure("/abc2", "Series")
+        self.assertEqual(first.fullPathName, "/abc1/Series")
+        self.assertEqual(second.fullPathName, "/abc2/Series")
+        self.assertIsNot(first, second)
+
+    def test_unknown_create_outcome_blocks_the_other_alias(self):
+        client = AliasDirectoryClient()
+        client.create_folder = Mock(side_effect=TimeoutError("unknown"))
+        manager = self.manager(client)
+        with self.assertRaises(TimeoutError):
+            manager.ensure("/abc1", "Series")
+        with self.assertRaises(OSError):
+            manager.ensure("/abc2", "Series")
+        client.create_folder.assert_called_once()
+        client.files["/Series"] = "remote:/Series"
+        self.assertEqual(manager.ensure("/abc2", "Series").id, "remote:/Series")
+
+    def test_slow_failed_create_renews_uncertainty_for_both_aliases(self):
+        client = AliasDirectoryClient()
+        manager = self.manager(client)
+        clock = [0]
+
+        def timeout(*args):
+            clock[0] = 90
+            raise TimeoutError("slow unknown outcome")
+
+        client.create_folder = Mock(side_effect=timeout)
+        module = sys.modules[f"{PACKAGE}.folder_manager"]
+        with patch.object(module, "monotonic", lambda: clock[0]):
+            with self.assertRaises(TimeoutError):
+                manager.ensure("/abc1", "Series")
+            with self.assertRaises(OSError):
+                manager.ensure("/abc2", "Series")
+        client.create_folder.assert_called_once()
+
+    def test_alias_query_failure_never_creates_or_uses_cached_result(self):
+        client = AliasDirectoryClient()
+        manager = self.manager(client)
+        manager.ensure("/abc1", "Series")
+        client.get_sub_files = Mock(side_effect=OSError("unavailable"))
+        with self.assertRaises(OSError):
+            manager.ensure("/abc2", "Series")
+        self.assertEqual(client.creates, ["/abc1/Series"])
+
+    def test_aliases_with_different_existing_ids_are_rejected(self):
+        client = AliasDirectoryClient()
+        manager = self.manager(client)
+        manager.ensure("/abc1", "Series")
+        client.files["/Series"] = "different-folder"
+        with self.assertRaises(OSError):
+            manager.ensure("/abc2", "Series")
+        self.assertEqual(client.creates, ["/abc1/Series"])
+
+    def test_group_and_prefix_boundaries_do_not_collide(self):
+        manager = FolderManager(None, LOGGER, shared_groups=[("/abc1", "/abc2"),
+                                                            ("/other1", "/other2")])
+        self.assertEqual(manager._key("/abc1/Series"), manager._key("/abc2/Series"))
+        self.assertNotEqual(manager._key("/abc1/Series"), manager._key("/other1/Series"))
+        self.assertNotEqual(manager._key("/abc1/Series"), manager._key("/abc12/Series"))
+        self.assertEqual(manager._key("/abc2"), "/abc2")
+
+    def test_shared_rule_configuration_and_validation(self):
+        module = balance_module
+        rule = {"prefix": "/abc", "shared_directories": True, "branches": [
+            {"path": "/abc1", "capacity_gb": 20},
+            {"path": "/abc2", "capacity_gb": 30},
+        ]}
+        parsed = module.parse_rules([rule])
+        self.assertEqual(module.shared_directory_groups(parsed), [("/abc", "/abc1", "/abc2")])
+        for invalid in ("true", 1, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                module.parse_rules([{**rule, "shared_directories": invalid}])
+        for invalid in ("/", "/abc1/sub"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                module.parse_rules([{**rule, "prefix": invalid}])
+        independent = {**rule, "shared_directories": False}
+        self.assertEqual(module.shared_directory_groups(module.parse_rules([independent])), [])
+
+
+class BalancedUploadTests(unittest.TestCase):
+    class SourceFile:
+        # Model the Linux runtime path while stat() uses a real local fixture.
+        def __init__(self, file):
+            self.name = file.name
+            self.stat = file.stat
+
+        def __str__(self):
+            return f"/PTTemp/{self.name}"
+
+    def make_api(self, mode="direct_write", shared=False, lag=False):
+        balancer = api_module.UploadBalancer([
+            {"prefix": "/abc1", "shared_directories": shared, "branches": [
+                {"path": "/abc1", "capacity_bytes": 700},
+                {"path": "/abc2", "capacity_bytes": 800},
+            ]},
+        ], [], lambda records: None)
+        client = AliasDirectoryClient(lag=lag) if shared else DirectoryClient()
+        if not shared:
+            client.files = {path: directory(path) for path in ("/abc1", "/abc2")}
+        api = api_module.CloudDriveApi(client, "test", upload_mode=mode,
+                                       upload_balancer=balancer)
+        return api, client, balancer
+
+    def test_fifteen_parallel_episodes_share_input_but_not_routed_targets(self):
+        for mode in ("direct_write", "remote_upload", "local_upload", "local_fallback"):
+            with self.subTest(mode=mode), TemporaryDirectory() as temp:
+                api, client, balancer = self.make_api(
+                    "local_upload" if mode == "local_fallback" else mode
+                )
+                original = "/abc1/Series/Season 1/"
+                shared = api.get_folder(Path(original))
+                if mode == "local_upload":
+                    api._local_upload_mappings = [local.LocalPathMapping("/", "/mapped")]
+                files = []
+                for i in range(15):
+                    file = Path(temp) / f"E{i:02}.mkv"
+                    file.write_bytes(b"x" * 100)
+                    files.append(self.SourceFile(file))
+                ready = Barrier(15)
+                uploading = Barrier(15)
+                seen = []
+                guard = Lock()
+
+                def transfer(target, file, *args):
+                    # Keep every upload alive until all reservations are made.
+                    uploading.wait(timeout=5)
+                    with guard:
+                        seen.append((target, target.path, target.fileid))
+                    return SimpleNamespace(path=target.path + file.name)
+
+                api._upload_direct_write = transfer
+                api._upload_remote_upload = transfer
+                api._upload_local_source = transfer
+
+                def upload(file):
+                    ready.wait(timeout=5)
+                    return api.upload(shared, file)
+
+                with ThreadPoolExecutor(max_workers=15) as pool:
+                    results = list(pool.map(upload, files))
+                paths = [path for _, path, _ in seen]
+                self.assertEqual(paths.count(original), 7)
+                self.assertEqual(paths.count("/abc2/Series/Season 1/"), 8)
+                self.assertEqual(shared.path, original)
+                for target, path, fileid in seen:
+                    self.assertEqual(fileid, path.rstrip("/"))
+                    if path.startswith("/abc2/"):
+                        self.assertIsNot(target, shared)
+                self.assertTrue(all(result is not None for result in results))
+                self.assertCountEqual(client.creates, [
+                    "/abc1/Series", "/abc1/Series/Season 1",
+                    "/abc2/Series", "/abc2/Series/Season 1",
+                ])
+                self.assertEqual(balancer._reservations, {})
+                self.assertEqual(sum(r["size"] for r in balancer._records
+                                     if r["folder"] == "/abc1"), 700)
+                self.assertEqual(sum(r["size"] for r in balancer._records
+                                     if r["folder"] == "/abc2"), 800)
+
+    def test_shared_branches_create_each_real_directory_once_in_all_modes(self):
+        for lag in (False, True):
+            for mode in ("direct_write", "remote_upload", "local_upload", "local_fallback"):
+                with self.subTest(lag=lag, mode=mode), TemporaryDirectory() as temp:
+                    api, client, balancer = self.make_api(
+                        "local_upload" if mode == "local_fallback" else mode,
+                        shared=True, lag=lag,
+                    )
+                    shared = api.get_folder(Path("/abc1/Series/Season 1/"))
+                    if mode == "local_upload":
+                        api._local_upload_mappings = [local.LocalPathMapping("/", "/mapped")]
+                    ready = Barrier(15)
+                    seen = []
+                    guard = Lock()
+
+                    def transfer(target, file, *args):
+                        ready.wait(timeout=5)
+                        with guard:
+                            seen.append((target.path, target.fileid))
+                        return SimpleNamespace(path=target.path + file.name)
+
+                    api._upload_direct_write = transfer
+                    api._upload_remote_upload = transfer
+                    api._upload_local_source = transfer
+                    files = []
+                    for i in range(15):
+                        file = Path(temp) / f"E{i:02}.mkv"
+                        file.write_bytes(b"x" * 100)
+                        files.append(self.SourceFile(file))
+                    with ThreadPoolExecutor(max_workers=15) as pool:
+                        results = list(pool.map(lambda file: api.upload(shared, file), files))
+                    self.assertTrue(all(result is not None for result in results))
+                    self.assertEqual([p for p, _ in seen].count("/abc1/Series/Season 1/"), 7)
+                    self.assertEqual([p for p, _ in seen].count("/abc2/Series/Season 1/"), 8)
+                    self.assertEqual({id for _, id in seen}, {"remote:/Series/Season 1"})
+                    self.assertEqual(client.creates, ["/abc1/Series", "/abc1/Series/Season 1"])
+                    self.assertEqual(set(client.files), {"/Series", "/Series/Season 1"})
+                    self.assertEqual(shared.path, "/abc1/Series/Season 1/")
+                    self.assertEqual(balancer._reservations, {})
+                    self.assertEqual(sum(r["size"] for r in balancer._records
+                                         if r["folder"] == "/abc1"), 700)
+                    self.assertEqual(sum(r["size"] for r in balancer._records
+                                         if r["folder"] == "/abc2"), 800)
+
+    def test_routed_directory_failure_releases_quota_and_does_not_upload(self):
+        api, client, balancer = self.make_api()
+        _, first = balancer.reserve("/abc1/Series/Season 1/", 700)
+        balancer.finish(first, success=True)
+        shared = api.get_folder(Path("/abc1/Series/Season 1/"))
+        api.get_folder = Mock(return_value=None)
+        api._upload_direct_write = Mock()
+        with TemporaryDirectory() as temp:
+            file = Path(temp) / "E08.mkv"
+            file.write_bytes(b"x" * 100)
+            self.assertIsNone(api.upload(shared, file))
+        api.get_folder.assert_called_once_with(Path("/abc2/Series/Season 1/"))
+        api._upload_direct_write.assert_not_called()
+        self.assertEqual(shared.path, "/abc1/Series/Season 1/")
+        self.assertEqual(balancer._reservations, {})
+        self.assertEqual(len(balancer._records), 1)
 
 
 class LocalUploadTests(unittest.TestCase):

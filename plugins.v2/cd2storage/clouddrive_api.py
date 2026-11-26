@@ -24,7 +24,7 @@ from .local_upload import (
 from .remote_channel import RemoteUploadChannel
 from .remote_hash import HashResult, RemoteHashCache, RemoteHashDispatcher
 from .remote_upload import ReadResult, RemoteReadDispatcher, RemoteUploadCancelled
-from .upload_balancer import UploadBalancer
+from .upload_balancer import UploadBalancer, shared_directory_groups
 
 
 # 115/CD2：移动或「从含撇号的旧名改到其它名」时不稳定；先脱敏的是**源侧末段名/路径**
@@ -138,7 +138,10 @@ class CloudDriveApi:
         :param upload_mode (str): 上传模式
         """
         self.client = client
-        self._folders = FolderManager(client, logger)
+        self._folders = FolderManager(
+            client, logger,
+            shared_groups=shared_directory_groups(upload_balancer.rules) if upload_balancer else (),
+        )
         self._disk_name = disk_name
         self._download_base = (download_base or "http://127.0.0.1:19798").rstrip("/")
         self._upload_mode = upload_mode
@@ -755,7 +758,6 @@ class CloudDriveApi:
         routed_path = original_path
         file_size = None
         reservation = None
-        path_changed = False
         result = None
 
         logger.info(
@@ -779,20 +781,15 @@ class CloudDriveApi:
 
         try:
             if routed_path != original_path:
-                try:
-                    target_dir.path = routed_path
-                    path_changed = True
-                except Exception as e:
-                    logger.warning(
-                        "【CloudDrive】无法修改上传目标目录，回退原目录并释放额度：原目录=%s，分流目录=%s，原因=%s",
-                        original_path,
-                        routed_path,
-                        e,
+                # Resolve a private target for this upload. MP may share the
+                # original FileItem between episodes; never mutate its path.
+                target_dir = self.get_folder(Path(routed_path))
+                if target_dir is None:
+                    logger.error(
+                        "【CloudDrive】分流目标目录获取或创建失败: original=%s routed=%s",
+                        original_path, routed_path,
                     )
-                    if balancer:
-                        balancer.finish(reservation, success=False)
-                    reservation = None
-                    routed_path = original_path
+                    return None
 
             logger.info(
                 "【CloudDrive】执行上传：原始目标目录=%s，最终目标目录=%s，文件=%s，大小=%s 字节，已预留分流额度=%s",
@@ -830,12 +827,8 @@ class CloudDriveApi:
             )
             return result
         finally:
-            try:
-                if path_changed:
-                    target_dir.path = original_path
-            finally:
-                if balancer:
-                    balancer.finish(reservation, success=result is not None)
+            if balancer:
+                balancer.finish(reservation, success=result is not None)
 
     def _upload_local_source(
         self,

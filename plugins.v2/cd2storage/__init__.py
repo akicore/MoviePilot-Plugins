@@ -279,7 +279,7 @@ class CD2Storage(_PluginBase):
                                             "label": "上传路径分流规则（JSON）",
                                             "rows": 8,
                                             "auto-grow": True,
-                                            "hint": '示例：[ {"prefix":"/abc/","branches":[{"path":"/abc1/","capacity_gb":20},{"path":"/abc2/","capacity_gb":30}]} ]。按规则顺序匹配；容量按十进制 GB 统计近 24 小时成功上传量。',
+                                            "hint": '示例：[ {"prefix":"/abc/","branches":[{"path":"/abc1/","capacity_gb":20},{"path":"/abc2/","capacity_gb":30}]} ]。按规则顺序匹配；容量按十进制 GB 统计近 24 小时成功上传量。同一实际网盘目录的多个入口，在该规则中增加 "shared_directories":true，原前缀和各分支将共享目录创建；独立目录请勿开启。',
                                             "persistent-hint": True,
                                         },
                                     }

@@ -21,6 +21,32 @@ def _normalize_path(path: Any) -> str:
     return "/" + "/".join(parts) if parts else "/"
 
 
+def shared_directory_groups(rules):
+    """Explicit aliases only: equal suffixes alone do not prove identity."""
+    groups = []
+    aliases = []
+    for rule in rules:
+        shared = rule.get("shared_directories", False)
+        if not isinstance(shared, bool):
+            raise ValueError("shared_directories must be true or false")
+        if not shared:
+            continue
+        group = tuple(dict.fromkeys(
+            _normalize_path(path) for path in
+            [rule["prefix"], *(branch["path"] for branch in rule["branches"])]
+        ))
+        for path in group:
+            if path == "/":
+                raise ValueError("shared directory prefixes cannot be CD2's virtual root")
+            for previous in aliases:
+                if (path == previous or path.startswith(previous + "/")
+                        or previous.startswith(path + "/")):
+                    raise ValueError(f"shared directory prefixes overlap: {previous}, {path}")
+            aliases.append(path)
+        groups.append(group)
+    return groups
+
+
 def parse_rules(value: Any) -> List[Dict[str, Any]]:
     """Parse ordered path-prefix rules from the plugin form's JSON field."""
     if not value or not str(value).strip():
@@ -54,7 +80,11 @@ def parse_rules(value: Any) -> List[Dict[str, Any]]:
                     "capacity_bytes": int(capacity_gb * BYTES_PER_GB),
                 }
             )
-        rules.append({"prefix": prefix, "branches": parsed_branches})
+        parsed = {"prefix": prefix, "branches": parsed_branches}
+        if "shared_directories" in rule:
+            parsed["shared_directories"] = rule["shared_directories"]
+        rules.append(parsed)
+    shared_directory_groups(rules)
     return rules
 
 
