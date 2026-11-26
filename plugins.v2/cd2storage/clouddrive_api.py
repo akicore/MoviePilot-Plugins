@@ -903,7 +903,13 @@ class CloudDriveApi:
             if destination == ".":
                 destination = "/"
             target = rpc.find(destination)
-            if not target.isDirectory or target.isLocal or target.readOnly:
+            # `readOnly` is present in newer CD2 schemas, but the bundled
+            # clouddrive2-client protobuf may predate that field.
+            if (
+                not target.isDirectory
+                or target.isLocal
+                or getattr(target, "readOnly", False)
+            ):
                 raise OSError(f"本地上传目标必须是可写网盘目录: {destination}")
             target_name = new_name or local_path.name
             target_path = (PurePosixPath(destination) / target_name).as_posix()
