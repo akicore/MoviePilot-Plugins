@@ -30,13 +30,22 @@ class RemoteUploadSession:
                 f"path={self.path}"
             )
 
-    def messages(self, check_callback: Callable[[], None], timeout: float = 300):
+    def messages(
+        self,
+        check_callback: Callable[[], None],
+        timeout: float = 300,
+        activity_time: Optional[Callable[[], float]] = None,
+    ):
         while True:
             deadline = monotonic() + timeout
             while True:
                 if self.error is not None:
                     raise self.error
                 check_callback()
+                # A long hash scan is active while CD2 acknowledges progress,
+                # even if no new server request arrives during that scan.
+                if activity_time is not None:
+                    deadline = max(deadline, activity_time() + timeout)
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
