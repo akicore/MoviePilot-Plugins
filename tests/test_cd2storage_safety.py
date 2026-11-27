@@ -12,6 +12,8 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+import grpc
+
 PLUGIN = Path(__file__).resolve().parents[1] / "plugins.v2" / "cd2storage"
 PACKAGE = "cd2_safety_test"
 package = ModuleType(PACKAGE)
@@ -141,6 +143,41 @@ class AliasDirectoryClient:
             )
 
 
+class MissingDirectory(grpc.RpcError):
+    def code(self):
+        return grpc.StatusCode.NOT_FOUND
+
+
+class IndexedAliasDirectoryClient(AliasDirectoryClient):
+    """CD2 must refresh each ancestor before a peer's deep path resolves."""
+    def __init__(self):
+        super().__init__()
+        self.indexed = set(self.prefixes) | {"/"}
+        self.listings = []
+        self.hidden_counts = {}
+
+    def get_sub_files(self, path, force_refresh=False):
+        with self.guard:
+            self.listings.append((path, force_refresh))
+            if path not in self.indexed:
+                raise MissingDirectory(f"parent not indexed: {path}")
+        entries = super().get_sub_files(path, force_refresh=force_refresh)
+        with self.guard:
+            remaining = self.hidden_counts.get(path, 0)
+            if remaining:
+                self.hidden_counts[path] -= 1
+                return []
+            if force_refresh:
+                self.indexed.update(file.fullPathName for file in entries)
+        return entries
+
+    def create_folder(self, parent, name):
+        result = super().create_folder(parent, name)
+        with self.guard:
+            self.indexed.add(result.folderCreated.fullPathName)
+        return result
+
+
 class DirectoryTests(unittest.TestCase):
     def test_twelve_parallel_episodes_create_each_component_once(self):
         client = DirectoryClient()
@@ -261,9 +298,9 @@ class SharedDirectoryTests(unittest.TestCase):
         return FolderManager(client, LOGGER, shared_groups=[("/abc1", "/abc2")])
 
     def test_parallel_first_creation_through_both_aliases(self):
-        for lag in (False, True):
-            with self.subTest(lag=lag):
-                client = AliasDirectoryClient(lag=lag)
+        for fixture in (AliasDirectoryClient, IndexedAliasDirectoryClient):
+            with self.subTest(fixture=fixture.__name__):
+                client = fixture()
                 manager = self.manager(client)
                 ready = Barrier(12)
 
@@ -283,27 +320,158 @@ class SharedDirectoryTests(unittest.TestCase):
     def test_peer_listing_prevents_duplicate_after_cache_expiry_or_restart(self):
         for reset in (False, True):
             with self.subTest(reset=reset):
-                client = AliasDirectoryClient()
+                client = IndexedAliasDirectoryClient()
                 manager = self.manager(client)
                 manager.ensure("/abc1", "Series")
                 if reset:
                     manager = self.manager(client)
                 else:
                     manager._recent.clear()
-                client.hidden_prefixes.add("/abc2")
+                client.hidden_counts["/abc2"] = 1
                 result = manager.ensure("/abc2", "Series")
                 self.assertEqual(result.id, "remote:/Series")
                 self.assertEqual(result.fullPathName, "/abc2/Series")
                 self.assertEqual(client.creates, ["/abc1/Series"])
 
-    def test_cached_alias_projection_does_not_change_original_proto(self):
-        client = AliasDirectoryClient(lag=True)
+    def test_refreshed_alias_does_not_change_original_proto(self):
+        client = IndexedAliasDirectoryClient()
         manager = self.manager(client)
         first = manager.ensure("/abc1", "Series")
         second = manager.ensure("/abc2", "Series")
         self.assertEqual(first.fullPathName, "/abc1/Series")
         self.assertEqual(second.fullPathName, "/abc2/Series")
         self.assertIsNot(first, second)
+
+    def test_peer_ancestors_are_refreshed_before_listing_new_show(self):
+        client = IndexedAliasDirectoryClient()
+        manager = self.manager(client)
+        manager.ensure("/abc1", "Cartoons")
+        # The category is already indexed through both entries, as in the log.
+        client.get_sub_files("/abc2", force_refresh=True)
+        show = manager.ensure("/abc1/Cartoons", "Series")
+        self.assertNotIn("/abc2/Cartoons/Series", client.indexed)
+        before = len(client.listings)
+        season = manager.ensure(show.fullPathName, "Season 1")
+        self.assertEqual(season.id, "remote:/Cartoons/Series/Season 1")
+        self.assertEqual(client.listings[before:], [
+            ("/abc1/Cartoons/Series", True),
+            ("/abc2", True), ("/abc2/Cartoons", True),
+            ("/abc2/Cartoons/Series", True),
+        ])
+        self.assertEqual(client.creates, [
+            "/abc1/Cartoons", "/abc1/Cartoons/Series",
+            "/abc1/Cartoons/Series/Season 1",
+        ])
+
+    def test_deep_unindexed_target_is_refreshed_without_creating_duplicates(self):
+        client = IndexedAliasDirectoryClient()
+        manager = self.manager(client)
+        path = "/abc1"
+        for name in ("TV", "Year", "Series", "Season 1"):
+            path = client.create_folder(path, name).folderCreated.fullPathName
+        original_creates = list(client.creates)
+        client.indexed = {p for p in client.indexed
+                          if not p.startswith("/abc2/")}
+        result = manager.ensure("/abc2/TV/Year/Series", "Season 1")
+        self.assertEqual(result.fullPathName, "/abc2/TV/Year/Series/Season 1")
+        self.assertEqual(result.id, "remote:/TV/Year/Series/Season 1")
+        self.assertIn(result.fullPathName, client.indexed)
+        self.assertEqual(client.creates, original_creates)
+
+    def test_optional_missing_peer_parent_is_not_listed(self):
+        client = IndexedAliasDirectoryClient()
+        manager = self.manager(client)
+        manager.ensure("/abc1", "Series")
+        client.hidden_prefixes.add("/abc2")
+        before = len(client.listings)
+        result = manager.ensure("/abc1/Series", "Season 1")
+        self.assertEqual(result.id, "remote:/Series/Season 1")
+        self.assertEqual(client.listings[before:], [
+            ("/abc1/Series", True), ("/abc2", True),
+        ])
+        self.assertEqual(len(client.creates), 2)
+
+    def test_invisible_alias_is_not_fabricated_or_created_again(self):
+        client = IndexedAliasDirectoryClient()
+        manager = self.manager(client)
+        first = manager.ensure("/abc1", "Series")
+        client.hidden_prefixes.add("/abc2")
+        module = sys.modules[f"{PACKAGE}.folder_manager"]
+        with patch.object(module, "sleep") as pause:
+            with self.assertRaises(OSError):
+                manager.ensure("/abc2", "Series")
+        self.assertEqual(pause.call_count, manager.VISIBILITY_ATTEMPTS - 1)
+        self.assertEqual(client.creates, ["/abc1/Series"])
+        self.assertNotIn("/abc2/Series", client.indexed)
+        self.assertEqual(first.fullPathName, "/abc1/Series")
+        self.assertEqual(manager._locks, {})
+        client.hidden_prefixes.clear()
+        self.assertEqual(manager.ensure("/abc2", "Series").id, first.id)
+        self.assertEqual(client.creates, ["/abc1/Series"])
+
+    def test_temporarily_invisible_alias_is_retried_with_force_refresh(self):
+        client = IndexedAliasDirectoryClient()
+        manager = self.manager(client)
+        first = manager.ensure("/abc1", "Series")
+        client.hidden_counts["/abc2"] = 2
+        module = sys.modules[f"{PACKAGE}.folder_manager"]
+        with patch.object(module, "sleep") as pause:
+            result = manager.ensure("/abc2", "Series")
+        pause.assert_called_once_with(manager.VISIBILITY_RETRY_SECONDS)
+        self.assertEqual(result.id, first.id)
+        self.assertIn(result.fullPathName, client.indexed)
+        self.assertEqual(client.creates, ["/abc1/Series"])
+        self.assertTrue(all(refresh for _, refresh in client.listings))
+
+    def test_alias_identity_must_match_after_refresh(self):
+        client = IndexedAliasDirectoryClient()
+        manager = self.manager(client)
+        manager.ensure("/abc1", "Series")
+        original = client.get_sub_files
+        client.hidden_counts["/abc2"] = 1
+
+        def listing(path, force_refresh=False):
+            entries = original(path, force_refresh=force_refresh)
+            if path == "/abc2" and entries:
+                return [directory("/abc2/Series", "unexpected-provider-id")]
+            return entries
+
+        client.get_sub_files = listing
+        with self.assertRaises(OSError):
+            manager.ensure("/abc2", "Series")
+        self.assertEqual(client.creates, ["/abc1/Series"])
+
+    def test_unavailable_target_parent_never_creates_children(self):
+        client = IndexedAliasDirectoryClient()
+        manager = self.manager(client)
+        manager.ensure("/abc1", "Series")
+        client.hidden_prefixes.add("/abc2")
+        with self.assertRaises(OSError):
+            manager.ensure("/abc2/Series", "Season 1")
+        self.assertEqual(client.creates, ["/abc1/Series"])
+
+    def test_not_found_mid_stream_does_not_retry_or_create(self):
+        client = IndexedAliasDirectoryClient()
+
+        def listing(*args, **kwargs):
+            yield directory("/abc1/Series", "remote:/Series")
+            raise MissingDirectory("stream failed")
+
+        client.get_sub_files = Mock(side_effect=listing)
+        with self.assertRaises(OSError):
+            self.manager(client).ensure("/abc1", "Series")
+        client.get_sub_files.assert_called_once_with("/abc1", force_refresh=True)
+        self.assertEqual(client.creates, [])
+
+    def test_permission_failure_does_not_trigger_parent_recovery(self):
+        error = grpc.RpcError("permission denied")
+        error.code = lambda: grpc.StatusCode.PERMISSION_DENIED
+        client = IndexedAliasDirectoryClient()
+        client.get_sub_files = Mock(side_effect=error)
+        with self.assertRaises(grpc.RpcError):
+            self.manager(client).ensure("/abc2/Series", "Season 1")
+        client.get_sub_files.assert_called_once()
+        self.assertEqual(client.creates, [])
 
     def test_unknown_create_outcome_blocks_the_other_alias(self):
         client = AliasDirectoryClient()
@@ -389,14 +557,17 @@ class BalancedUploadTests(unittest.TestCase):
         def __str__(self):
             return f"/PTTemp/{self.name}"
 
-    def make_api(self, mode="direct_write", shared=False, lag=False):
+    def make_api(self, mode="direct_write", shared=False, indexed=False):
         balancer = api_module.UploadBalancer([
             {"prefix": "/abc1", "shared_directories": shared, "branches": [
                 {"path": "/abc1", "capacity_bytes": 700},
                 {"path": "/abc2", "capacity_bytes": 800},
             ]},
         ], [], lambda records: None)
-        client = AliasDirectoryClient(lag=lag) if shared else DirectoryClient()
+        if shared:
+            client = IndexedAliasDirectoryClient() if indexed else AliasDirectoryClient()
+        else:
+            client = DirectoryClient()
         if not shared:
             client.files = {path: directory(path) for path in ("/abc1", "/abc2")}
         api = api_module.CloudDriveApi(client, "test", upload_mode=mode,
@@ -460,12 +631,12 @@ class BalancedUploadTests(unittest.TestCase):
                                      if r["folder"] == "/abc2"), 800)
 
     def test_shared_branches_create_each_real_directory_once_in_all_modes(self):
-        for lag in (False, True):
+        for indexed in (False, True):
             for mode in ("direct_write", "remote_upload", "local_upload", "local_fallback"):
-                with self.subTest(lag=lag, mode=mode), TemporaryDirectory() as temp:
+                with self.subTest(indexed=indexed, mode=mode), TemporaryDirectory() as temp:
                     api, client, balancer = self.make_api(
                         "local_upload" if mode == "local_fallback" else mode,
-                        shared=True, lag=lag,
+                        shared=True, indexed=indexed,
                     )
                     shared = api.get_folder(Path("/abc1/Series/Season 1/"))
                     if mode == "local_upload":
@@ -502,6 +673,24 @@ class BalancedUploadTests(unittest.TestCase):
                                          if r["folder"] == "/abc1"), 700)
                     self.assertEqual(sum(r["size"] for r in balancer._records
                                          if r["folder"] == "/abc2"), 800)
+
+    def test_invisible_routed_alias_releases_quota_without_uploading(self):
+        api, client, balancer = self.make_api(shared=True, indexed=True)
+        _, first = balancer.reserve("/abc1/Series/Season 1/", 700)
+        balancer.finish(first, success=True)
+        shared = api.get_folder(Path("/abc1/Series/Season 1/"))
+        client.hidden_prefixes.add("/abc2")
+        api._upload_direct_write = Mock()
+        module = sys.modules[f"{PACKAGE}.folder_manager"]
+        with TemporaryDirectory() as temp, patch.object(module, "sleep"):
+            file = Path(temp) / "E08.mkv"
+            file.write_bytes(b"x" * 100)
+            self.assertIsNone(api.upload(shared, file))
+        api._upload_direct_write.assert_not_called()
+        self.assertEqual(client.creates, ["/abc1/Series", "/abc1/Series/Season 1"])
+        self.assertEqual(shared.path, "/abc1/Series/Season 1/")
+        self.assertEqual(balancer._reservations, {})
+        self.assertEqual(len(balancer._records), 1)
 
     def test_routed_directory_failure_releases_quota_and_does_not_upload(self):
         api, client, balancer = self.make_api()
