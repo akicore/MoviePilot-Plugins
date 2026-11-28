@@ -7,12 +7,13 @@ import logging
 from pathlib import Path, PurePosixPath
 import sys
 from tempfile import TemporaryDirectory
-from threading import Barrier, Lock
+from threading import Barrier, Event, Lock
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import grpc
+from google.protobuf.empty_pb2 import Empty
 
 PLUGIN = Path(__file__).resolve().parents[1] / "plugins.v2" / "cd2storage"
 PACKAGE = "cd2_safety_test"
@@ -821,6 +822,75 @@ class LocalUploadTests(unittest.TestCase):
         request = rpc.call.call_args.args[1]
         self.assertEqual(request.destPath, "/cloud/Series")
         self.assertEqual(request.conflictPolicy, pb.CopyFileRequest.Overwrite)
+
+    def make_cleanup_api(self):
+        client = SimpleNamespace(jwt_token="test-token", stub=Mock())
+        api = api_module.CloudDriveApi(client, "test", upload_mode="local_upload")
+        rpc = api._local_upload_rpc
+        rpc.find = Mock(side_effect=lambda path: (
+            pb.CloudDriveFile(id=path, isLocal=True, size=100)
+            if path.startswith("/local/") else directory(path)
+        ))
+        rpc.copy_tasks = Mock(return_value=[])
+        copied_paths = set()
+
+        def copy(source, destination):
+            copied_paths.add(f"{destination}/{PurePosixPath(source).name}")
+            return pb.FileOperationResult(success=True)
+
+        rpc.copy = Mock(side_effect=copy)
+        rpc.uploads = Mock(side_effect=lambda path: [upload(path)] if path in copied_paths else [])
+        rpc.cloud_file = Mock(side_effect=lambda path, size=None: cloud_file(path) if size else None)
+        api.get_item = Mock(side_effect=lambda path: SimpleNamespace(
+            path=path.as_posix(), type="file", size=100,
+        ))
+        return api, client.stub.RemoveCompletedCopyTasks
+
+    @staticmethod
+    def upload_local(api, name):
+        source = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=100), is_file=lambda: True)
+        return api._upload_local_source(SimpleNamespace(path="/cloud/Series"), source,
+                                        f"/local/{name}", name)
+
+    def test_cleanup_uses_completed_copy_rpc_after_success(self):
+        api, cleanup = self.make_cleanup_api()
+        with patch.object(api, "get_item", return_value=None):
+            self.assertIsNone(self.upload_local(api, "E01.mkv"))
+        cleanup.assert_not_called()
+        self.assertIsNotNone(self.upload_local(api, "E02.mkv"))
+        cleanup.assert_called_once_with(Empty(), metadata=[("authorization", "Bearer test-token")],
+                                        timeout=30)
+
+    def test_cleanup_failure_preserves_upload_result(self):
+        api, cleanup = self.make_cleanup_api()
+        cleanup.side_effect = [grpc.RpcError("cleanup failed"), Empty()]
+        self.assertIsNotNone(self.upload_local(api, "E01.mkv"))
+        self.assertIsNotNone(self.upload_local(api, "E02.mkv"))
+        self.assertEqual(cleanup.call_count, 2)
+
+    def test_cleanup_waits_for_parallel_upload_even_if_it_fails(self):
+        api, cleanup = self.make_cleanup_api()
+        entered, release = Event(), Event()
+        get_item = api.get_item.side_effect
+
+        def verify(path):
+            if path.name == "E02.mkv":
+                entered.set()
+                release.wait(timeout=5)
+                return None
+            return get_item(path)
+
+        api.get_item.side_effect = verify
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.upload_local, api, "E02.mkv")
+            try:
+                self.assertTrue(entered.wait(timeout=5))
+                self.assertIsNotNone(self.upload_local(api, "E01.mkv"))
+                cleanup.assert_not_called()
+            finally:
+                release.set()
+            self.assertIsNone(pending.result(timeout=5))
+        cleanup.assert_called_once()
 
 
 if __name__ == "__main__":

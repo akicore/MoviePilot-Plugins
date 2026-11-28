@@ -134,6 +134,9 @@ class LocalUploadRpc:
     def copy_tasks(self):
         return self.call("GetCopyTasks", Empty()).copyTasks
 
+    def remove_completed_copy_tasks(self) -> None:
+        self.call("RemoveCompletedCopyTasks", Empty())
+
     def rename(self, path: str, name: str):
         return self.checked(self.call("RenameFile", pb.RenameFileRequest(
             theFilePath=path, newName=name,

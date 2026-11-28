@@ -1,5 +1,6 @@
 from enum import IntEnum
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from time import monotonic, sleep
 from typing import Any, Dict, List, Literal, Optional
 from uuid import NAMESPACE_DNS, getnode, uuid4, uuid5
@@ -146,6 +147,10 @@ class CloudDriveApi:
         self._download_base = (download_base or "http://127.0.0.1:19798").rstrip("/")
         self._upload_mode = upload_mode
         self._local_upload_mappings = local_upload_mappings or []
+        self._local_upload_rpc = LocalUploadRpc(client)
+        self._local_upload_lock = Lock()
+        self._local_uploads_in_progress = 0
+        self._local_upload_cleanup_pending = False
         self._upload_balancer = upload_balancer
         self._remote_channel = RemoteUploadChannel(
             client,
@@ -838,11 +843,14 @@ class CloudDriveApi:
         new_name: Optional[str] = None,
     ) -> Optional[FileItem]:
         """Ask CD2 to copy its configured local-folder source into the cloud."""
+        with self._local_upload_lock:
+            self._local_uploads_in_progress += 1
+        succeeded = False
         try:
             stat = local_path.stat()
             if not local_path.is_file():
                 raise OSError(f"本地上传源不是普通文件: {local_path}")
-            rpc = LocalUploadRpc(self.client)
+            rpc = self._local_upload_rpc
             source = rpc.find(cd2_source_path)
             if (
                 not source
@@ -898,6 +906,7 @@ class CloudDriveApi:
                     or normalize_path(result.path) != final_path):
                 raise OSError(f"CD2 本地上传完成但目标文件未通过最终校验: {final_path}")
             progress_callback(100)
+            succeeded = True
             return result
         except RemoteUploadCancelled:
             logger.info("【CloudDrive】本地上传已取消: %s", cd2_source_path)
@@ -909,6 +918,23 @@ class CloudDriveApi:
                 e,
             )
             return None
+        finally:
+            self._finish_local_upload(succeeded)
+
+    def _finish_local_upload(self, succeeded: bool) -> None:
+        with self._local_upload_lock:
+            self._local_uploads_in_progress -= 1
+            self._local_upload_cleanup_pending |= succeeded
+            # Completed copy records can still be needed by another upload's
+            # verification. Keep new uploads from starting during cleanup.
+            if self._local_uploads_in_progress or not self._local_upload_cleanup_pending:
+                return
+            try:
+                self._local_upload_rpc.remove_completed_copy_tasks()
+            except Exception as error:
+                logger.warning("【CloudDrive】清理已完成复制任务失败: %s", error)
+            else:
+                self._local_upload_cleanup_pending = False
 
     def _upload_remote_upload(
         self,
